@@ -208,6 +208,58 @@ class TTSSegment:
     extra_instruct: str | None = None
 
 
+def _normalize_segment_speaker_label(raw: str) -> str:
+    """Strip wrappers/punctuation Qwen sometimes adds around dialogue labels."""
+    t = (raw or "").strip()
+    while t.endswith((":", ".", ",", ";")):
+        t = t[:-1].strip()
+    t = t.strip('"').strip("'").strip()
+    while t.endswith((":", ".", ",", ";")):
+        t = t[:-1].strip()
+    return t
+
+
+def resolve_clone_prompt_for_speaker(
+    clone_prompts: dict[str, VoiceClonePrompt],
+    speaker: str,
+    *,
+    fallback_key: str = "Narrator",
+) -> tuple[VoiceClonePrompt | None, str]:
+    """Match segment ``speaker`` to a per-character clone (case-insensitive on cast keys).
+
+    OmniVoice only receives the resolved ``VoiceClonePrompt`` (built per cast member in Step 2)
+    plus segment ``text`` / optional ``extra_instruct``. This mapping is therefore what ties
+    dialogue lines to the right voice.
+    """
+    if not clone_prompts:
+        return None, ""
+
+    label = _normalize_segment_speaker_label(speaker)
+    if not label:
+        label = fallback_key
+
+    if label in clone_prompts:
+        return clone_prompts[label], label
+
+    by_lower: dict[str, tuple[str, VoiceClonePrompt]] = {
+        k.lower(): (k, v) for k, v in clone_prompts.items()
+    }
+    hit = by_lower.get(label.lower())
+    if hit:
+        canon, vcp = hit
+        return vcp, canon
+
+    if fallback_key in clone_prompts:
+        return clone_prompts[fallback_key], fallback_key
+
+    fb = by_lower.get(fallback_key.lower())
+    if fb:
+        canon, vcp = fb
+        return vcp, canon
+
+    return None, ""
+
+
 @dataclass
 class AudiobookPlan:
     """Server-side session object (keep in Gradio ``State``)."""
@@ -358,8 +410,8 @@ def _character_research_schema_and_field_guide() -> str:
 Field guide:
 - **summary**: who they are in the story (not voice).
 - **voice_gender**: exactly **male** or **female**. If unclear, use **male** (do not use "unknown" for gender).
-- **voice_age**: align with OmniVoice when possible: child, teenager, young adult, middle-aged, elderly — or a short phrase that maps clearly (e.g. "very old" → elderly).
-- **voice_characteristics**: how they *sound* in plain English (timbre, tempo, energy). Map mentally to **pitch** / **whisper** tokens below; avoid tagging moods as if they were OmniVoice tokens.
+- **voice_age**: align with OmniVoice when possible: child, teenager, young adult, middle-aged, elderly.
+- **voice_characteristics**: how they *sound* in plain English (timbre, tempo, energy). Only use OmniVoice tokens.
 - **voice_accent**: free-text locale or style that maps to **one** English accent name from the OmniVoice list (e.g. "RP British" → british accent); use "unknown" if not inferable.
 
 OmniVoice reference (your descriptions feed Step 2 `voice_instruct`):
@@ -587,6 +639,63 @@ def build_clone_prompts_for_cast(
     return prompts, samples
 
 
+def apply_external_reference_voice_to_character(
+    plan: AudiobookPlan,
+    character_name: str,
+    audio: tuple[int, np.ndarray] | None,
+    ref_transcript: str | None = None,
+) -> AudiobookPlan:
+    """Replace one cast member’s clone prompt with an uploaded reference clip."""
+    from book2audio.synthesis import build_voice_clone_from_reference_audio
+
+    name = (character_name or "").strip()
+    if not name:
+        raise ValueError("Select a character name")
+    if not plan.characters:
+        raise ValueError("No cast in session — run voice setup first")
+    card = next((c for c in plan.characters if c.name.lower() == name.lower()), None)
+    if card is None:
+        raise ValueError(f"No character named {name!r} in the current cast")
+    canonical = card.name.strip()
+    vcp, preview, prate = build_voice_clone_from_reference_audio(
+        audio,
+        ref_text=(ref_transcript or "").strip() or None,
+    )
+    plan.clone_prompts[canonical] = vcp
+    plan.voice_samples[canonical] = (prate, preview)
+    return plan
+
+
+def regenerate_single_voice_sample(
+    plan: AudiobookPlan,
+    character_name: str,
+    *,
+    sample_steps: int,
+    sample_line: str | None,
+) -> AudiobookPlan:
+    """Re-run OmniVoice sample + clone prompt for one cast member; updates ``plan`` in place."""
+    name = (character_name or "").strip()
+    if not name:
+        raise ValueError("Select a character name")
+    if not plan.characters:
+        raise ValueError("No cast in session — run voice setup first")
+    card = next((c for c in plan.characters if c.name.lower() == name.lower()), None)
+    if card is None:
+        raise ValueError(f"No character named {name!r} in the current cast")
+    name = card.name.strip()
+
+    steps = max(4, int(sample_steps))
+    line = (sample_line or "").strip() or None
+    prompts, samples = build_clone_prompts_for_cast(
+        [card],
+        sample_steps=steps,
+        sample_line=line,
+    )
+    plan.clone_prompts[name] = prompts[name]
+    plan.voice_samples[name] = samples[name]
+    return plan
+
+
 def prepare_chapter_segments(
     chapter_body: str,
     character_names: list[str],
@@ -595,10 +704,16 @@ def prepare_chapter_segments(
     names = ", ".join(character_names)
     system = (
         "You prepare novel text for expressive text-to-speech. JSON only. "
-        "Speakers must be from the provided list."
+        "Each segment `speaker` MUST be exactly one of the allowed JSON strings (verbatim); "
+        "otherwise the audiobook engine cannot select the correct voice clone."
     )
     body = (chapter_body or "").strip()[:14_000]
-    user = f"""Characters: {names}
+    cast_verbatim = "\n".join(f"  {json.dumps(n, ensure_ascii=False)}" for n in character_names)
+    user = f"""Cast overview: {names}
+
+Each segment's `speaker` must be EXACTLY one of these strings (copy spelling, spaces, and casing):
+{cast_verbatim}
+  "Narrator"
 
 Chapter text:
 {body}
@@ -609,8 +724,9 @@ Return JSON:
 ]}}
 
 Rules:
-- Use speaker "Narrator" for narration / inner monologue unless a named character speaks dialogue.
-- For tricky names, add IPA once, e.g. Hermione (hɜːˈmaɪəni).
+- Use `speaker` "Narrator" only for unattributed narration or inner monologue; use a cast name when a named character speaks (including lines like “they said” if the speaker is known from context).
+- Never invent new `speaker` values or use pronouns (“he”, “she”, “they”) as `speaker` — always the character’s listed name or "Narrator".
+- For tricky names, add IPA once inside `text`, e.g. Hermione (hɜːˈmaɪəni).
 - You may prefix [emotion] tags like [warmly], [tense], [sorrowful] inside `text` where useful.
 - `extra_instruct` rarely: only a single extra allowed tag such as whisper (otherwise null).
 - Split into natural beats (dialogue vs narration). Keep each text under ~400 characters when possible."""
@@ -624,7 +740,7 @@ Rules:
     for s in segs:
         if not isinstance(s, dict):
             continue
-        sp = str(s.get("speaker", "Narrator")).strip() or "Narrator"
+        sp = _normalize_segment_speaker_label(str(s.get("speaker", "Narrator"))) or "Narrator"
         tx = str(s.get("text", "")).strip()
         if not tx:
             continue
@@ -651,10 +767,21 @@ def synthesize_segments(
     pause = np.zeros(int(SAMPLE_RATE * pause_ms / 1000), dtype=np.float32)
     chunks: list[np.ndarray] = []
     for seg in segments:
-        vcp = clone_prompts.get(seg.speaker) or clone_prompts.get(fallback_key)
+        vcp, canon_key = resolve_clone_prompt_for_speaker(
+            clone_prompts,
+            seg.speaker,
+            fallback_key=fallback_key,
+        )
         if vcp is None:
             logger.warning("No clone for speaker %r — skipping line", seg.speaker)
             continue
+        norm_sp = _normalize_segment_speaker_label(seg.speaker)
+        if norm_sp.lower() != canon_key.lower():
+            logger.info(
+                "Segment speaker %r → using voice clone for %r",
+                seg.speaker,
+                canon_key,
+            )
         res = synthesize_voice_clone_to_numpy(
             seg.text,
             vcp,

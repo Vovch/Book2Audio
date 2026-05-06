@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
+import re
+import tempfile
+import wave
+import zipfile
 from typing import Any
 
 import gradio as gr
+import numpy as np
 
 from book2audio.audiobook_pipeline import (
     AudiobookPlan,
     EXAMPLE_CHARACTERS_EDITOR_JSON,
+    apply_external_reference_voice_to_character,
     assign_omnivoice_profiles,
     build_clone_prompts_for_cast,
     character_rows_to_editor_json,
     format_character_research_messages_for_external_llm,
     parse_character_json,
     prepare_chapter_segments,
+    regenerate_single_voice_sample,
     research_characters,
     split_into_chapters,
     synthesize_segments,
@@ -24,6 +33,140 @@ from book2audio.audiobook_pipeline import (
 from book2audio.device import pick_device_and_dtype
 from book2audio.llm_qwen import default_llm_model_id
 from book2audio.synthesis import synthesize_to_numpy
+
+def _wav_bytes_mono_float32(sample_rate: int, audio: np.ndarray) -> bytes:
+    s = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
+    pcm = np.clip(s * 32767.0, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def _safe_voice_sample_filename(name: str) -> str:
+    base = re.sub(r'[<>:"/\\|?*\n\r]+', "_", (name or "").strip()) or "voice"
+    return base[:120]
+
+
+def _zip_voice_samples_to_tempfile(plan: AudiobookPlan) -> str:
+    fd, path = tempfile.mkstemp(prefix="book2audio_voice_samples_", suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for display_name, (rate, wav) in plan.voice_samples.items():
+                fn = _safe_voice_sample_filename(display_name) + ".wav"
+                zf.writestr(fn, _wav_bytes_mono_float32(rate, wav))
+        return path
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+
+def _regenerate_selected_voice_sample(
+    character_name: str,
+    sample_steps: float,
+    sample_line: str,
+    session: AudiobookPlan | None,
+) -> tuple[Any, str, AudiobookPlan]:
+    plan = session or AudiobookPlan()
+    if not character_name:
+        gr.Warning("Choose a character in the dropdown first.")
+        return None, "No character selected.", plan
+    pick = str(character_name).strip()
+    canonical = next(
+        (c.name for c in plan.characters if c.name.lower() == pick.lower()),
+        pick,
+    )
+    try:
+        regenerate_single_voice_sample(
+            plan,
+            pick,
+            sample_steps=int(sample_steps),
+            sample_line=sample_line,
+        )
+    except ValueError as exc:
+        gr.Warning(str(exc))
+        return (
+            plan.voice_samples.get(canonical),
+            str(exc),
+            plan,
+        )
+    except Exception as exc:
+        gr.Error(f"Regenerate failed: {exc}")
+        return (
+            plan.voice_samples.get(canonical),
+            str(exc),
+            plan,
+        )
+    audio = plan.voice_samples.get(canonical)
+    return (
+        audio,
+        f"Regenerated sample for “{canonical}”.",
+        plan,
+    )
+
+
+def _apply_external_voice_sample(
+    character_name: str,
+    ref_audio: tuple[int, np.ndarray] | None,
+    ref_transcript: str,
+    session: AudiobookPlan | None,
+) -> tuple[Any, str, AudiobookPlan]:
+    plan = session or AudiobookPlan()
+    if not character_name:
+        gr.Warning("Choose a character in the dropdown first.")
+        return None, "No character selected.", plan
+    pick = str(character_name).strip()
+    canonical = next(
+        (c.name for c in plan.characters if c.name.lower() == pick.lower()),
+        pick,
+    )
+    try:
+        apply_external_reference_voice_to_character(
+            plan,
+            pick,
+            ref_audio,
+            ref_transcript=ref_transcript,
+        )
+    except ValueError as exc:
+        gr.Warning(str(exc))
+        return (
+            plan.voice_samples.get(canonical),
+            str(exc),
+            plan,
+        )
+    except Exception as exc:
+        gr.Error(f"Could not use uploaded clip: {exc}")
+        return (
+            plan.voice_samples.get(canonical),
+            str(exc),
+            plan,
+        )
+    audio = plan.voice_samples.get(canonical)
+    return (
+        audio,
+        f"Applied external reference clip to “{canonical}”.",
+        plan,
+    )
+
+
+def _download_all_voice_samples_zip(session: AudiobookPlan | None) -> str | None:
+    plan = session or AudiobookPlan()
+    if not plan.voice_samples:
+        gr.Warning("No voice samples yet — run “Assign voice tags & generate samples” first.")
+        return None
+    try:
+        return _zip_voice_samples_to_tempfile(plan)
+    except Exception as exc:
+        gr.Error(f"Could not build ZIP: {exc}")
+        return None
+
 
 def _synthesize_for_ui(text: str, instruct: str):
     result = synthesize_to_numpy(text, instruct)
@@ -290,7 +433,9 @@ def main() -> None:
                 gr.Markdown("### Step 2 · Voice samples")
                 gr.Markdown(
                     "Qwen assigns OmniVoice voice tags from the character list; OmniVoice then synthesizes **one short clip per character** "
-                    "and builds voice-clone prompts. Edit the JSON above if needed, then run the button below."
+                    "and builds voice-clone prompts. Edit the JSON above if needed, then run the button below.\n\n"
+                    "You can also **upload your own short reference recording** for a character (after voice setup): pick them in the "
+                    "dropdown, add optional transcript text, and click **Use uploaded clip**."
                 )
                 sample_line = gr.Textbox(
                     label="Line spoken in each voice sample (same line for every character if filled)",
@@ -317,6 +462,31 @@ def main() -> None:
                     value=None,
                 )
                 voice_preview = gr.Audio(label="Voice sample", type="numpy")
+                btn_regen_voice = gr.Button(
+                    "Regenerate selected voice sample",
+                    variant="secondary",
+                )
+                external_ref_audio = gr.Audio(
+                    label="External reference clip (optional · for selected character)",
+                    type="numpy",
+                )
+                external_ref_transcript = gr.Textbox(
+                    label="Words spoken in that clip (recommended; else OmniVoice may ASR)",
+                    lines=2,
+                    placeholder='Exact transcript of the uploaded audio.',
+                )
+                btn_apply_external_voice = gr.Button(
+                    "Use uploaded clip for selected character",
+                    variant="secondary",
+                )
+                samples_zip = gr.File(
+                    label="Download all voice samples (.zip)",
+                    interactive=False,
+                )
+                btn_download_samples = gr.Button(
+                    "Build ZIP of all voice samples",
+                    variant="secondary",
+                )
 
                 with gr.Accordion("Later · chapter pipeline", open=False):
                     gr.Markdown(
@@ -375,6 +545,23 @@ def main() -> None:
                     _voice_preview_select,
                     inputs=[voice_pick, session],
                     outputs=voice_preview,
+                )
+                btn_regen_voice.click(
+                    _regenerate_selected_voice_sample,
+                    inputs=[voice_pick, sample_steps, sample_line, session],
+                    outputs=[voice_preview, log_voices, session],
+                    show_progress="full",
+                )
+                btn_apply_external_voice.click(
+                    _apply_external_voice_sample,
+                    inputs=[voice_pick, external_ref_audio, external_ref_transcript, session],
+                    outputs=[voice_preview, log_voices, session],
+                    show_progress="full",
+                )
+                btn_download_samples.click(
+                    _download_all_voice_samples_zip,
+                    inputs=[session],
+                    outputs=[samples_zip],
                 )
                 btn_prep.click(
                     _prepare_chapter,

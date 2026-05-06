@@ -187,6 +187,73 @@ def synthesize_to_numpy(
     return SAMPLE_RATE, chunk
 
 
+def _mono_float32_from_gradio(
+    audio: tuple[int, np.ndarray] | None,
+) -> tuple[int, np.ndarray] | None:
+    """Normalize Gradio ``Audio(type='numpy')`` to ``(sample_rate, mono float32)`` or ``None``."""
+    if audio is None:
+        return None
+    sr, data = audio
+    if data is None:
+        return None
+    raw = np.asarray(data)
+    if raw.size == 0:
+        return None
+    if raw.dtype.kind in "iu":
+        x = (raw.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+    else:
+        x = raw.astype(np.float32, copy=False)
+        peak = float(np.nanmax(np.abs(x))) if x.size else 0.0
+        if peak > 1.5:
+            x = np.clip(x / 32767.0, -1.0, 1.0)
+    if x.ndim == 1:
+        mono = x
+    elif x.ndim == 2:
+        # Gradio uses (samples, channels); OmniVoice uses (channels, samples) sometimes.
+        mono = np.mean(x, axis=1) if x.shape[0] >= x.shape[1] else np.mean(x, axis=0)
+    else:
+        return None
+    mono = np.clip(mono.reshape(-1), -1.0, 1.0)
+    return int(sr), mono
+
+
+def _resample_mono_linear(wav: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Cheap linear resample for UI preview (matches :data:`SAMPLE_RATE` used elsewhere)."""
+    if sr_in == sr_out:
+        return np.asarray(wav, dtype=np.float32).reshape(-1)
+    w = np.asarray(wav, dtype=np.float32).reshape(1, 1, -1)
+    t = torch.from_numpy(w)
+    new_len = max(1, int(round(wav.shape[-1] * sr_out / sr_in)))
+    t2 = torch.nn.functional.interpolate(t, size=new_len, mode="linear", align_corners=True)
+    return t2.squeeze().numpy().astype(np.float32)
+
+
+def build_voice_clone_from_reference_audio(
+    audio: tuple[int, np.ndarray] | None,
+    ref_text: str | None = None,
+    *,
+    preprocess_prompt: bool = True,
+) -> tuple[VoiceClonePrompt, np.ndarray, int]:
+    """Build a :class:`VoiceClonePrompt` from an uploaded clip; preview at :data:`SAMPLE_RATE`.
+
+    *ref_text*: transcript of the clip. Empty or ``None`` triggers OmniVoice ASR (if available).
+    """
+    pair = _mono_float32_from_gradio(audio)
+    if pair is None:
+        raise ValueError("No audio: upload a non-empty reference clip.")
+    sr_in, mono = pair
+    model = get_or_load_model()
+    tensor = torch.from_numpy(mono).unsqueeze(0)
+    rt = (ref_text or "").strip() or None
+    vcp = model.create_voice_clone_prompt(
+        ref_audio=(tensor, sr_in),
+        ref_text=rt,
+        preprocess_prompt=preprocess_prompt,
+    )
+    preview = _resample_mono_linear(mono, sr_in, SAMPLE_RATE)
+    return vcp, preview, SAMPLE_RATE
+
+
 def build_voice_clone_from_instruct(
     instruct: str,
     sample_text: str | None = None,
