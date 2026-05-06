@@ -293,9 +293,10 @@ def main() -> None:
                     "and builds voice-clone prompts. Edit the JSON above if needed, then run the button below."
                 )
                 sample_line = gr.Textbox(
-                    label="Line spoken in each voice sample",
+                    label="Line spoken in each voice sample (same line for every character if filled)",
                     value="Hello — this is my voice for this story.",
                     lines=1,
+                    placeholder="Leave empty to use each character’s name + role/summary as the sample line.",
                 )
                 sample_steps = gr.Slider(
                     minimum=4,

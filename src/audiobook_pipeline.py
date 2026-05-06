@@ -21,15 +21,48 @@ from omnivoice.models.omnivoice import VoiceClonePrompt
 
 logger = logging.getLogger(__name__)
 
-_INSTRUCT_RULES = """OmniVoice English voice tags (comma + space separated). Use only these tokens:
-male, female, child, teenager, young adult, middle-aged, elderly,
-very low pitch, low pitch, moderate pitch, high pitch, very high pitch,
-whisper,
-american accent, british accent, australian accent, chinese accent, canadian accent,
-indian accent, korean accent, portuguese accent, russian accent, japanese accent."""
+# Summarized from OmniVoice docs (voice-design mode).
+# Source: https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md
+OMNIVOICE_VOICE_DESIGN_LLM_DOC = """
+OmniVoice **voice design** (downstream TTS): the app will turn each character into an
+`instruct` string — comma + space separated attributes in **English** (case-insensitive).
+Each attribute belongs to **one category** (gender, age, pitch, style, accent, or Chinese dialect).
+**Only one token per category.** Do not use free-text mood words as tags (e.g. not “anxious”,
+“breathless”); describe prose in **voice_* fields** so they can be mapped to the tokens below.
+
+**Gender:** male | female
+
+**Age:** child | teenager | young adult | middle-aged | elderly
+
+**Pitch:** very low pitch | low pitch | moderate pitch | high pitch | very high pitch
+
+**Style:** whisper
+
+**English accents** (use when book/audio is English; pick **one**):
+american accent, british accent, australian accent, canadian accent, indian accent,
+chinese accent, korean accent, japanese accent, portuguese accent, russian accent
+
+**Chinese dialects** (only when synthesis text is Chinese; full-width comma in pure-Chinese strings):
+河南话, 陕西话, 四川话, 贵州话, 云南话, 桂林话, 济南话, 石家庄话, 甘肃话, 宁夏话, 青岛话, 东北话
+
+**Writing tips (from OmniVoice docs):** combine one token from each category you care about,
+e.g. `female, young adult, high pitch, british accent`. English uses half-width commas + space.
+Accent applies to English speech; dialect applies to Chinese speech — do not mix accent+dialect
+in the same design string. Omit categories you don’t care about; a minimal design is still valid.
+
+Doc link: https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md
+""".strip()
+
+_INSTRUCT_RULES = (
+    "OmniVoice `voice_instruct` must use **only** allowed English tokens, comma + space, "
+    "**one per category** (gender, age, pitch, optional whisper, accent for English). "
+    "Never output raw mood words or hyphenated non-tokens (e.g. use `high pitch` not `high-pitched`).\n\n"
+    + OMNIVOICE_VOICE_DESIGN_LLM_DOC
+)
 
 CHARACTER_RESEARCH_SYSTEM_PROMPT = (
-    "You extract literary casts with **how each character should sound** for audiobook casting. "
+    "You extract literary casts with **how each character should sound** for audiobook casting with **OmniVoice** "
+    "(downstream TTS uses fixed voice-design tokens from the user message — align voice_* fields with those lists). "
     "Reply with one JSON object only, no markdown."
 )
 
@@ -90,6 +123,73 @@ def _normalize_character_row(item: dict[str, Any]) -> dict[str, str] | None:
     elif gl == "male":
         out["voice_gender"] = "male"
     return out
+
+
+def _omnivoice_instruct_from_row(row: dict[str, Any]) -> str:
+    """Build OmniVoice tag string from editor voice_* fields when the LLM returns a weak instruct."""
+    g = str(row.get("voice_gender", "male")).strip().lower()
+    gender = "female" if g == "female" else "male"
+    age_raw = str(row.get("voice_age", "middle-aged")).strip().lower()
+    age_aliases = [
+        ("child", "child"),
+        ("teenager", "teenager"),
+        ("young adult", "young adult"),
+        ("young", "young adult"),
+        ("middle-aged", "middle-aged"),
+        ("middle aged", "middle-aged"),
+        ("elderly", "elderly"),
+    ]
+    age = "middle-aged"
+    for needle, tag in age_aliases:
+        if needle in age_raw or age_raw == needle.replace(" ", "-"):
+            age = tag
+            break
+    ch = str(row.get("voice_characteristics", "")).lower()
+    if "whisper" in ch:
+        pitch = "whisper"
+    elif any(x in ch for x in ("very low", "deep", "gravel")):
+        pitch = "very low pitch"
+    elif any(x in ch for x in ("low pitch", "low,", " low ", "deep")):
+        pitch = "low pitch"
+    elif any(x in ch for x in ("very high", "shrill")):
+        pitch = "very high pitch"
+    elif any(x in ch for x in ("high pitch", "bright", "light")):
+        pitch = "high pitch"
+    else:
+        pitch = "moderate pitch"
+
+    acc_raw = str(row.get("voice_accent", "")).strip().lower()
+    accent = "american accent"
+    if any(x in acc_raw for x in ("british", "uk ", " uk", "rp ", " england")):
+        accent = "british accent"
+    elif "australian" in acc_raw:
+        accent = "australian accent"
+    elif "canadian" in acc_raw:
+        accent = "canadian accent"
+    elif "indian" in acc_raw:
+        accent = "indian accent"
+    elif any(x in acc_raw for x in ("chinese", "mandarin", "cantonese")):
+        accent = "chinese accent"
+    elif "japanese" in acc_raw:
+        accent = "japanese accent"
+    elif "korean" in acc_raw:
+        accent = "korean accent"
+    elif "russian" in acc_raw:
+        accent = "russian accent"
+    elif "portuguese" in acc_raw or "brazil" in acc_raw:
+        accent = "portuguese accent"
+
+    return f"{gender}, {age}, {pitch}, {accent}"
+
+
+def _instruct_from_llm_usable(instruct: str, *, default: str = "moderate pitch, american accent") -> bool:
+    s = (instruct or "").strip()
+    if len(s) < 12:
+        return False
+    if s.lower() == default.lower():
+        return False
+    low = s.lower()
+    return ("male" in low or "female" in low) and ("accent" in low or "pitch" in low or "whisper" in low)
 
 
 @dataclass
@@ -242,7 +342,7 @@ def gather_character_research_blob(
 
 
 def _character_research_schema_and_field_guide() -> str:
-    return """Return JSON exactly in this shape (every character MUST include voice fields — infer cautiously if needed):
+    return f"""Return JSON exactly in this shape (every character MUST include voice fields — infer cautiously if needed):
 {{"characters":[
   {{
     "name": string,
@@ -258,9 +358,12 @@ def _character_research_schema_and_field_guide() -> str:
 Field guide:
 - **summary**: who they are in the story (not voice).
 - **voice_gender**: exactly **male** or **female**. If unclear, use **male** (do not use "unknown" for gender).
-- **voice_age**: one of: child, teenager, young adult, middle-aged, elderly, unknown — or a short phrase (e.g. "very old", "about twelve").
-- **voice_characteristics**: how they *sound*: pitch (deep/light), tempo, timbre (gravelly, smooth, nasal), energy, emotion typical of speech, quirks. Plain English.
-- **voice_accent**: region or style of speech if known or strongly implied (e.g. "American South", "RP British", "neutral American"); use "unknown" if not inferable.
+- **voice_age**: align with OmniVoice when possible: child, teenager, young adult, middle-aged, elderly — or a short phrase that maps clearly (e.g. "very old" → elderly).
+- **voice_characteristics**: how they *sound* in plain English (timbre, tempo, energy). Map mentally to **pitch** / **whisper** tokens below; avoid tagging moods as if they were OmniVoice tokens.
+- **voice_accent**: free-text locale or style that maps to **one** English accent name from the OmniVoice list (e.g. "RP British" → british accent); use "unknown" if not inferable.
+
+OmniVoice reference (your descriptions feed Step 2 `voice_instruct`):
+{OMNIVOICE_VOICE_DESIGN_LLM_DOC}
 
 Try to find and describe all the characters in the book, starting from the major characters."""
 
@@ -352,42 +455,109 @@ def research_characters(
 
 
 def assign_omnivoice_profiles(rows: list[dict[str, Any]]) -> list[CharacterCard]:
-    """Map rough character rows to OmniVoice `voice_instruct` strings (validated by OmniVoice later)."""
+    """Map editor rows to :class:`CharacterCard`; Qwen supplies ``voice_instruct`` when helpful.
+
+    **role** and **summary** always come from the pasted editor JSON so OmniVoice samples
+    and clone prompts stay aligned with the user's cast. Weak or generic LLM tags are
+    replaced with :func:`_omnivoice_instruct_from_row`.
+    """
     system = (
-        "You assign TTS voice design tags to story characters. "
-        "Honor **voice_gender**, **voice_age**, **voice_characteristics**, and **voice_accent** from each row "
-        "when building `voice_instruct`. **voice_gender** is only male or female; if missing or unclear, treat as **male**. "
-        "Output JSON only. "
+        "You assign OmniVoice **voice design** `voice_instruct` strings to story characters. "
+        "Follow the OmniVoice attribute rules below exactly: only allowed tokens, comma + space, one per category. "
+        "Honor **voice_gender**, **voice_age**, **voice_characteristics**, and **voice_accent** from each row. "
+        "**voice_gender** is only male or female; if missing or unclear, treat as **male**. "
+        "Output JSON only.\n\n"
         + _INSTRUCT_RULES
     )
     payload = {"characters": rows, "narrator_default": AudiobookPlan().narrator_instruct}
     user = f"""{json.dumps(payload, ensure_ascii=False)}
 
 Return JSON:
-{{"voices":[{{"name":string,"role":string,"summary":string,"voice_instruct":string}}]}}
+{{"voices":[{{"name":string,"voice_instruct":string}}]}}
 
-Include one entry named exactly "Narrator" for omniscient prose (male or female ok).
-voice_instruct must use only allowed tags, comma-separated English."""
+Rules:
+- For **every** object in input ``characters``, output exactly one ``voices`` entry with the **same** ``name`` string.
+- ``voice_instruct`` MUST use **only** tokens from the OmniVoice lists above (comma + space); **one token per category**; map ``voice_accent`` prose to one **accent** token (English book → English accent).
+- Do **not** emit mood words, hyphenated invented tags, or comma-separated prose traits as tags.
+- If there is no "Narrator" in the cast but you add one for omniscient prose, use an extra entry; otherwise do not invent names."""
 
     raw = chat_complete(system, user, max_new_tokens=1200)
     data = extract_json_object(raw)
     voices = data.get("voices")
     if not isinstance(voices, list):
         raise ValueError("Expected voices[]")
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for v in voices:
+        if isinstance(v, dict):
+            n = str(v.get("name", "")).strip()
+            if n:
+                by_name[n.lower()] = v
+
+    default_ins = "moderate pitch, american accent"
     out: list[CharacterCard] = []
+    row_names_lower: set[str] = set()
+
+    for row in rows:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        row_names_lower.add(name.lower())
+        role = str(row.get("role", "")).strip()
+        summary = str(row.get("summary", "")).strip()
+        v = by_name.get(name.lower())
+        llm_ins = str(v.get("voice_instruct", "")).strip() if v else ""
+        if _instruct_from_llm_usable(llm_ins, default=default_ins):
+            instruct = llm_ins
+        else:
+            instruct = _omnivoice_instruct_from_row(row)
+            if llm_ins:
+                logger.info(
+                    "Using editor voice_* fields for %r (LLM instruct missing or generic)",
+                    name,
+                )
+        out.append(
+            CharacterCard(
+                name=name,
+                role=role,
+                summary=summary,
+                voice_instruct=instruct,
+            )
+        )
+
     for v in voices:
         if not isinstance(v, dict):
             continue
+        name = str(v.get("name", "")).strip()
+        if not name or name.lower() in row_names_lower:
+            continue
+        llm_ins = str(v.get("voice_instruct", "")).strip() or default_ins
+        role = str(v.get("role", "")).strip()
+        summary = str(v.get("summary", "")).strip()
         out.append(
             CharacterCard(
-                name=str(v.get("name", "Unknown")).strip() or "Unknown",
-                role=str(v.get("role", "")).strip(),
-                summary=str(v.get("summary", "")).strip(),
-                voice_instruct=str(v.get("voice_instruct", "")).strip()
-                or "moderate pitch, american accent",
+                name=name,
+                role=role,
+                summary=summary,
+                voice_instruct=llm_ins,
             )
         )
+
     return out
+
+
+def _sample_line_for_character(card: CharacterCard) -> str:
+    """Spoken line for clone preview when the user leaves the global sample line empty."""
+    if card.summary.strip():
+        t = card.summary.strip()
+        if len(t) > 280:
+            t = t[:277] + "..."
+        return f"I'm {card.name}. {t}"
+    if card.role.strip():
+        return (
+            f"I'm {card.name}, {card.role.strip()} — this is my voice for this audiobook."
+        )
+    return f"Hello — this is {card.name}'s voice for this story."
 
 
 def build_clone_prompts_for_cast(
@@ -397,19 +567,18 @@ def build_clone_prompts_for_cast(
     sample_line: str | None = None,
 ) -> tuple[dict[str, VoiceClonePrompt], dict[str, tuple[int, np.ndarray]]]:
     """Synthesize a short clip per character, build clone prompts, return prompts + preview audio."""
-    line = (sample_line or "").strip() or (
-        "This is my voice for this story — listen carefully."
-    )
+    global_sample = (sample_line or "").strip()
     prompts: dict[str, VoiceClonePrompt] = {}
     samples: dict[str, tuple[int, np.ndarray]] = {}
     for c in cards:
         key = c.name.strip()
         if not key:
             continue
+        phrase = global_sample if global_sample else _sample_line_for_character(c)
         logger.info("Voice sample + clone prompt for %s", key)
         vcp, wav = build_voice_clone_from_instruct(
             c.voice_instruct,
-            sample_text=line,
+            sample_text=phrase,
             num_step=sample_steps,
             language="English",
         )
