@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book2audio"
+version = "0.1.0"
+description = "Book2Audio app layer on top of OmniVoice (library installed from PyPI)."
+requires-python = ">=3.10"
+dependencies = [
+    "omnivoice>=0.1.5",
+]
+
+[project.scripts]
+book2audio-tts = "book2audio.web_ui:main"
+
+[project.optional-dependencies]
+# Optional Windows DirectML PyTorch stack (not the recommended Book2Audio/OmniVoice path—use CPU via `pip install .`).
+# Pins torch-directml-compatible torch (2.4.x); torchaudio must match. transformers <5.8: 5.8+ expects newer torch than DML ships.
+amd = [
+    "torch-directml>=0.2.5.dev240914",
+    "torchaudio==2.4.1",
+    "transformers>=5.3.0,<5.8",
+]
+dev = [
+    "pytest>=8",
+]
+
+# Map import name "book2audio" to the src/ tree (no src/book2audio/ subfolder).
+[tool.setuptools.package-dir]
+book2audio = "src"
+
+[tool.setuptools]
+packages = ["book2audio"]
+py-modules = ["tts_web"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: real OmniVoice inference (slow; requires HF model cache)",
+]

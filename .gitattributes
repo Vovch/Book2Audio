@@ -1,0 +1,2 @@
+# Shell installers must use LF so they run on macOS/Linux from a Windows checkout.
+*.sh text eol=lf
