@@ -40,7 +40,7 @@ Agents should follow existing patterns in the repo once code exists; until then,
 
 End-user-oriented copy also lives in [README.md](README.md); keep both in sync when install steps change.
 
-**Code layout:** Python package **`book2audio`**, files in **`src/`** (`device.py`, `synthesis.py`, `web_ui.py`). Setuptools maps `book2audio` → `src/` so there is no `src/book2audio/` directory. Root [`tts_web.py`](tts_web.py) is a shim so `python tts_web.py` still works; the console script `book2audio-tts` calls `book2audio.web_ui:main`.
+**Code layout:** Python package **`book2audio`**, files in **`src/`** (`device.py`, `synthesis.py`, `web_ui.py`, `search_web.py`, `llm_qwen.py`, `audiobook_pipeline.py`). Setuptools maps `book2audio` → `src/` so there is no `src/book2audio/` directory. Root [`tts_web.py`](tts_web.py) is a shim so `python tts_web.py` still works; the console script `book2audio-tts` calls `book2audio.web_ui:main`.
 
 ### Requirements
 

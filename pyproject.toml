@@ -9,6 +9,8 @@ description = "Book2Audio app layer on top of OmniVoice (library installed from 
 requires-python = ">=3.10"
 dependencies = [
     "omnivoice>=0.1.5",
+    "httpx>=0.27",
+    "ddgs>=9.0.0",
 ]
 
 [project.scripts]

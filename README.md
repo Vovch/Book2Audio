@@ -2,12 +2,12 @@
 
 Turn books into audiobooks over time. Today this repo includes a small **Text-to-speech web demo** built on **[OmniVoice](https://github.com/k2-fsa/OmniVoice)** from PyPI (`omnivoice`). The library is a dependency only—no fork of OmniVoice is required.
 
-Application code is the **`book2audio`** Python package, rooted in **`src/`** (`device.py`, `synthesis.py`, `web_ui.py`, plus `__init__.py`). Root **`tts_web.py`** is only a shim so `python tts_web.py` still works after `pip install .`.
+Application code is the **`book2audio`** Python package, rooted in **`src/`** (`device.py`, `synthesis.py`, `web_ui.py`, `search_web.py`, `llm_qwen.py`, `audiobook_pipeline.py`, plus `__init__.py`). Root **`tts_web.py`** is only a shim so `python tts_web.py` still works after `pip install .`.
 
 ## Requirements
 
 - **Python 3.10+**
-- A **Hugging Face**–reachable network on first run (model weights download for `k2-fsa/OmniVoice`)
+- A **Hugging Face**–reachable network on first run (model weights download for `k2-fsa/OmniVoice` and the default `Qwen/Qwen3.5-0.8B` planner checkpoint)
 
 For AI assistants and contributors working in this repo, see **[AGENTS.md](AGENTS.md)** for product intent, ethics, and the same setup steps in agent-oriented form.
 
@@ -134,6 +134,18 @@ To allow local scripts permanently for your user (common dev setup):
 | `BOOK2AUDIO_SKIP_DML` | Set to `1` to ignore DirectML even if `torch-directml` is installed |
 
 With `auto`, order is: **CUDA → MPS → CPU**. **DirectML is not used in `auto`** (OmniVoice + torch-directml commonly fails with `RuntimeError: Cannot set version_counter for inference tensor`). On **AMD + Windows**, **`cpu`** (explicit or via `auto`) is the supported path; **`BOOK2AUDIO_DEVICE=dml`** is for experimentation only.
+
+### Audiobook tab (Qwen + web search)
+
+| Variable | Purpose |
+| -------- | ------- |
+| `BOOK2AUDIO_LLM_MODEL` | Optional: swap the planner checkpoint (default [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B)). Non–Qwen-3.5 ids are loaded with `AutoModelForCausalLM`—use only if you know the model matches. |
+| `BOOK2AUDIO_LLM_DEVICE` | Force LLM device: `cpu`, `cuda`, `mps` (otherwise follows OmniVoice device selection; DirectML backends default the LLM to **CPU**) |
+| `EXA_API_KEY` | Optional; [Exa](https://exa.ai) search API. Without it, DuckDuckGo HTML search is used (no key, lower quality). |
+
+The **Audiobook** Gradio tab runs: web snippets → Qwen character list → Qwen OmniVoice voice tags → a short **OmniVoice sample per role** (builds **voice-clone** prompts) → Qwen chapter segmentation (IPA/emotion hints in text) → **OmniVoice** line-by-line synthesis.
+
+Character research uses **public web results**; for obscure works, results may be thin—use the **editable JSON** to fix or paste the cast yourself.
 
 ---
 
