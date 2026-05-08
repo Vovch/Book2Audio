@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
+import wave
+import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from book2audio.llm_qwen import chat_complete, extract_json_object
 from book2audio.search_web import format_snippets_for_llm, search_snippets
 from book2audio.synthesis import (
     SAMPLE_RATE,
     build_voice_clone_from_instruct,
+    build_voice_clone_from_reference_audio,
     synthesize_voice_clone_to_numpy,
 )
 from omnivoice.models.omnivoice import VoiceClonePrompt
+from omnivoice.utils.voice_design import _INSTRUCT_CATEGORIES
 
-logger = logging.getLogger(__name__)
+# OmniVoice ``instruct`` keyword for hushed/breathy delivery (Style category; spelled in omnivoice pkg).
+OMNIVOICE_HUSHED_STYLE_TOKEN: str = next(iter(_INSTRUCT_CATEGORIES[3]))
+
+VOICE_ARCHIVE_JSON = "book2audio_session.json"
+VOICE_ARCHIVE_VERSION = 1
 
 # Summarized from OmniVoice docs (voice-design mode).
 # Source: https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md
@@ -36,7 +48,8 @@ Each attribute belongs to **one category** (gender, age, pitch, style, accent, o
 
 **Pitch:** very low pitch | low pitch | moderate pitch | high pitch | very high pitch
 
-**Style:** whisper
+**Style:** optional hushed / breathy speech — use the **Style** English token from
+`voice-design.md` (exactly the short keyword listed in that row for this category).
 
 **English accents** (use when book/audio is English; pick **one**):
 american accent, british accent, australian accent, canadian accent, indian accent,
@@ -55,14 +68,31 @@ Doc link: https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md
 
 _INSTRUCT_RULES = (
     "OmniVoice `voice_instruct` must use **only** allowed English tokens, comma + space, "
-    "**one per category** (gender, age, pitch, optional whisper, accent for English). "
+    "**one per category** (gender, age, pitch, optional hushed-speech style token, accent for English). "
     "Never output raw mood words or hyphenated non-tokens (e.g. use `high pitch` not `high-pitched`).\n\n"
     + OMNIVOICE_VOICE_DESIGN_LLM_DOC
 )
 
+# Shared across character research, voice-tag assignment, and chapter segmentation prompts.
+LLM_INSTRUCTIONS_TTS_SPEAKER_AND_CLONES = """
+**Audiobook TTS linkage (read carefully):**
+- Each JSON **`name`** is the **canonical speaker ID** for the rest of the pipeline. The app builds **one OmniVoice
+  voice clone per `name`** (from `voice_*` → `voice_instruct`, then a short sample). Later, chapter segmentation
+  emits a `speaker` string per line; TTS **selects the clone by that `speaker`**. It must be **exactly** one of the
+  cast `name` values or **`"Narrator"`** — never pronouns (**he**, **she**, **they**), nicknames you did not list,
+  or invented labels, or the line may get the wrong voice or be skipped.
+- **OmniVoice** is driven by **`voice_instruct`** (voice design tokens) and the spoken **text**; it does **not**
+  take the character’s **name** as a separate “role” control. Names matter because they **key** which saved clone
+  runs for each segment.
+- Include a **`Narrator`** row when you want a dedicated narration voice in the cast list; chapter prep still uses
+  `speaker` **`"Narrator"`** for unattributed narration / inner monologue when no listed character is speaking.
+""".strip()
+
 CHARACTER_RESEARCH_SYSTEM_PROMPT = (
     "You extract literary casts with **how each character should sound** for audiobook casting with **OmniVoice** "
     "(downstream TTS uses fixed voice-design tokens from the user message — align voice_* fields with those lists). "
+    "Each character **`name`** must be a **stable, canonical ID**: the same string is reused verbatim as the "
+    "chapter-segment **`speaker`** field (or use **`Narrator`** for narration rows). "
     "Reply with one JSON object only, no markdown."
 )
 
@@ -145,8 +175,9 @@ def _omnivoice_instruct_from_row(row: dict[str, Any]) -> str:
             age = tag
             break
     ch = str(row.get("voice_characteristics", "")).lower()
-    if "whisper" in ch:
-        pitch = "whisper"
+    tok = OMNIVOICE_HUSHED_STYLE_TOKEN
+    if tok in ch or "breathy" in ch or "hushed" in ch or "under breath" in ch:
+        pitch = tok
     elif any(x in ch for x in ("very low", "deep", "gravel")):
         pitch = "very low pitch"
     elif any(x in ch for x in ("low pitch", "low,", " low ", "deep")):
@@ -189,7 +220,10 @@ def _instruct_from_llm_usable(instruct: str, *, default: str = "moderate pitch, 
     if s.lower() == default.lower():
         return False
     low = s.lower()
-    return ("male" in low or "female" in low) and ("accent" in low or "pitch" in low or "whisper" in low)
+    tok = OMNIVOICE_HUSHED_STYLE_TOKEN
+    return ("male" in low or "female" in low) and (
+        "accent" in low or "pitch" in low or tok in low
+    )
 
 
 @dataclass
@@ -269,6 +303,8 @@ class AudiobookPlan:
     clone_prompts: dict[str, VoiceClonePrompt] = field(default_factory=dict)
     #: Short OmniVoice samples used to build clone prompts — for UI playback only.
     voice_samples: dict[str, tuple[int, np.ndarray]] = field(default_factory=dict)
+    #: Web-snippet blob from the last **local** extract (search + Qwen); empty for external-LLM-only workflows.
+    character_research_blob: str = ""
     narrator_instruct: str = (
         "male, middle-aged, moderate pitch, american accent"
     )
@@ -417,6 +453,8 @@ Field guide:
 OmniVoice reference (your descriptions feed Step 2 `voice_instruct`):
 {OMNIVOICE_VOICE_DESIGN_LLM_DOC}
 
+{LLM_INSTRUCTIONS_TTS_SPEAKER_AND_CLONES}
+
 Try to find and describe all the characters in the book, starting from the major characters."""
 
 
@@ -477,8 +515,8 @@ def research_characters(
     excerpt: str = "",
     *,
     on_progress: Callable[[float, str], None] | None = None,
-) -> dict[str, Any]:
-    """Web search + Qwen: return parsed JSON with ``characters`` list."""
+) -> tuple[dict[str, Any], str]:
+    """Web search + Qwen: return ``(parsed JSON with characters[], research_blob)``."""
 
     def _p(frac: float, msg: str) -> None:
         if on_progress:
@@ -503,7 +541,7 @@ def research_characters(
     if not isinstance(data.get("characters"), list):
         raise ValueError("LLM did not return characters[]")
     _p(1.0, "Character extraction finished.")
-    return data
+    return data, blob
 
 
 def assign_omnivoice_profiles(rows: list[dict[str, Any]]) -> list[CharacterCard]:
@@ -518,6 +556,8 @@ def assign_omnivoice_profiles(rows: list[dict[str, Any]]) -> list[CharacterCard]
         "Follow the OmniVoice attribute rules below exactly: only allowed tokens, comma + space, one per category. "
         "Honor **voice_gender**, **voice_age**, **voice_characteristics**, and **voice_accent** from each row. "
         "**voice_gender** is only male or female; if missing or unclear, treat as **male**. "
+        "Each returned `name` must match an input row’s `name` exactly — that string is the **speaker ID** "
+        "for later chapter JSON. "
         "Output JSON only.\n\n"
         + _INSTRUCT_RULES
     )
@@ -528,10 +568,12 @@ Return JSON:
 {{"voices":[{{"name":string,"voice_instruct":string}}]}}
 
 Rules:
-- For **every** object in input ``characters``, output exactly one ``voices`` entry with the **same** ``name`` string.
+- For **every** object in input ``characters``, output exactly one ``voices`` entry with the **same** ``name`` string (identical spelling and casing): that string is the **speaker ID** for chapter segmentation and voice-clone lookup.
 - ``voice_instruct`` MUST use **only** tokens from the OmniVoice lists above (comma + space); **one token per category**; map ``voice_accent`` prose to one **accent** token (English book → English accent).
 - Do **not** emit mood words, hyphenated invented tags, or comma-separated prose traits as tags.
-- If there is no "Narrator" in the cast but you add one for omniscient prose, use an extra entry; otherwise do not invent names."""
+- If there is no "Narrator" in the cast but you add one for omniscient prose, use an extra entry; otherwise do not invent names.
+
+{LLM_INSTRUCTIONS_TTS_SPEAKER_AND_CLONES}"""
 
     raw = chat_complete(system, user, max_new_tokens=1200)
     data = extract_json_object(raw)
@@ -646,8 +688,6 @@ def apply_external_reference_voice_to_character(
     ref_transcript: str | None = None,
 ) -> AudiobookPlan:
     """Replace one cast member’s clone prompt with an uploaded reference clip."""
-    from book2audio.synthesis import build_voice_clone_from_reference_audio
-
     name = (character_name or "").strip()
     if not name:
         raise ValueError("Select a character name")
@@ -664,6 +704,295 @@ def apply_external_reference_voice_to_character(
     plan.clone_prompts[canonical] = vcp
     plan.voice_samples[canonical] = (prate, preview)
     return plan
+
+
+def safe_voice_archive_basename(name: str) -> str:
+    """Filesystem-safe stem for WAV files in the voice archive (matches export naming)."""
+    base = re.sub(r'[<>:"/\\|?*\n\r]+', "_", (name or "").strip()) or "voice"
+    return base[:120]
+
+
+def read_wav_bytes_mono_float32(data: bytes) -> tuple[int, np.ndarray]:
+    """Load PCM WAV bytes → ``(sample_rate, mono float32)``. Prefer 16-bit mono/stereo."""
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        frames = wf.readframes(n_frames)
+    if sample_width == 1:
+        x = np.frombuffer(frames, dtype=np.uint8).astype(np.float32)
+        x = (x - 128.0) / 128.0
+    elif sample_width == 2:
+        x = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        x = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(
+            f"Unsupported WAV sample width {sample_width} (use 16-bit PCM for best results)"
+        )
+    if n_channels <= 1:
+        mono = x.reshape(-1)
+    else:
+        mono = np.mean(x.reshape(-1, n_channels), axis=1)
+    return framerate, mono.astype(np.float32)
+
+
+def voice_archive_dict_from_plan(plan: AudiobookPlan) -> dict[str, Any]:
+    """JSON sidecar written next to WAVs inside the downloadable archive."""
+    voice_files = {
+        n: f"{safe_voice_archive_basename(n)}.wav"
+        for n in plan.voice_samples.keys()
+    }
+    return {
+        "book2audio_archive_version": VOICE_ARCHIVE_VERSION,
+        "raw_character_rows": plan.raw_character_rows,
+        "character_cards": [
+            {
+                "name": c.name,
+                "role": c.role,
+                "summary": c.summary,
+                "voice_instruct": c.voice_instruct,
+            }
+            for c in plan.characters
+        ],
+        "narrator_instruct": plan.narrator_instruct,
+        "character_research_blob": plan.character_research_blob,
+        "voice_files": voice_files,
+    }
+
+
+def _find_zip_member_ci(zf: zipfile.ZipFile, basename: str) -> str | None:
+    want = Path(basename).name.lower()
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue
+        if Path(name).name.lower() == want:
+            return name
+    return None
+
+
+def character_cards_from_voice_archive_manifest(manifest: dict[str, Any]) -> list[CharacterCard]:
+    """Rebuild :class:`CharacterCard` instances from archive JSON (no Qwen)."""
+    cards_raw = manifest.get("character_cards")
+    rows_raw = manifest.get("raw_character_rows") or []
+    rows: list = list(rows_raw) if isinstance(rows_raw, list) else []
+
+    if isinstance(cards_raw, list) and cards_raw:
+        out: list[CharacterCard] = []
+        for d in cards_raw:
+            if not isinstance(d, dict):
+                continue
+            n = str(d.get("name", "")).strip()
+            if not n:
+                continue
+            vi = str(d.get("voice_instruct", "")).strip()
+            if not vi:
+                row = next(
+                    (
+                        r
+                        for r in rows
+                        if isinstance(r, dict)
+                        and str(r.get("name", "")).strip().lower() == n.lower()
+                    ),
+                    None,
+                )
+                vi = _omnivoice_instruct_from_row(
+                    row if row else {"name": n, "voice_gender": "male"}
+                )
+            out.append(
+                CharacterCard(
+                    name=n,
+                    role=str(d.get("role", "")).strip(),
+                    summary=str(d.get("summary", "")).strip(),
+                    voice_instruct=vi,
+                )
+            )
+        return out
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        n = str(row.get("name", "")).strip()
+        if not n:
+            continue
+        out.append(
+            CharacterCard(
+                name=n,
+                role=str(row.get("role", "")).strip(),
+                summary=str(row.get("summary", "")).strip(),
+                voice_instruct=_omnivoice_instruct_from_row(row),
+            )
+        )
+    return out
+
+
+def _minimal_row_for_wav_import(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "role": "Imported from WAV",
+        "summary": "Voice reference imported from filename; edit JSON for story context.",
+        "voice_gender": "male",
+        "voice_age": "middle-aged",
+        "voice_characteristics": "",
+        "voice_accent": "unknown",
+    }
+
+
+def import_voice_archive_from_zip_bytes(
+    data: bytes,
+    *,
+    on_progress: Callable[[float, str], None] | None = None,
+) -> AudiobookPlan:
+    """Load ``book2audio_session.json`` + WAVs from a ZIP, or WAV-only ZIP / loose WAV repack."""
+    plan = AudiobookPlan()
+    plan.last_segments = []
+
+    def _p(frac: float, msg: str) -> None:
+        if on_progress:
+            on_progress(max(0.0, min(1.0, frac)), msg)
+
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+        manifest: dict[str, Any] | None = None
+        try:
+            raw_m = zf.read(VOICE_ARCHIVE_JSON).decode("utf-8")
+            manifest = json.loads(raw_m)
+        except (KeyError, json.JSONDecodeError, UnicodeDecodeError):
+            manifest = None
+
+        voice_files: dict[str, Any] = {}
+        use_wav_only = manifest is None
+
+        if isinstance(manifest, dict):
+            ver = manifest.get("book2audio_archive_version", 0)
+            if ver > VOICE_ARCHIVE_VERSION:
+                logger.warning(
+                    "Archive format newer than this app (version %s)",
+                    ver,
+                )
+            rows = manifest.get("raw_character_rows") or []
+            plan.raw_character_rows = list(rows) if isinstance(rows, list) else []
+            plan.character_research_blob = str(manifest.get("character_research_blob") or "")
+            ni = manifest.get("narrator_instruct")
+            if isinstance(ni, str) and ni.strip():
+                plan.narrator_instruct = ni.strip()
+            plan.characters = character_cards_from_voice_archive_manifest(manifest)
+            vf = manifest.get("voice_files")
+            voice_files = vf if isinstance(vf, dict) else {}
+            if not plan.characters:
+                use_wav_only = True
+
+        if use_wav_only:
+            wav_members = sorted(
+                (
+                    n
+                    for n in zf.namelist()
+                    if n.lower().endswith(".wav") and not n.endswith("/")
+                ),
+                key=lambda x: Path(x).name.lower(),
+            )
+            seen_base: set[str] = set()
+            ordered: list[str] = []
+            for m in wav_members:
+                b = Path(m).name.lower()
+                if b in seen_base:
+                    continue
+                seen_base.add(b)
+                ordered.append(m)
+
+            if not ordered:
+                raise ValueError(
+                    "No book2audio_session.json (or empty cast) and no .wav files in ZIP."
+                )
+
+            rows = []
+            cards = []
+            for i, member in enumerate(ordered):
+                stem = Path(member).stem.strip()
+                disp = stem or f"voice_{i + 1}"
+                row = _minimal_row_for_wav_import(disp)
+                rows.append(row)
+                cards.append(
+                    CharacterCard(
+                        name=disp,
+                        role=row["role"],
+                        summary=row["summary"],
+                        voice_instruct=_omnivoice_instruct_from_row(row),
+                    )
+                )
+            plan.raw_character_rows = rows
+            plan.characters = cards
+            nload = len(cards)
+            plan.clone_prompts = {}
+            plan.voice_samples = {}
+            for i, card in enumerate(plan.characters):
+                member = ordered[i]
+                _p((i + 1) / max(nload, 1), f"Import WAV {i + 1}/{nload} ({card.name})…")
+                pcm = read_wav_bytes_mono_float32(zf.read(member))
+                vcp, preview, prate = build_voice_clone_from_reference_audio(
+                    pcm,
+                    ref_text=None,
+                )
+                plan.clone_prompts[card.name] = vcp
+                plan.voice_samples[card.name] = (prate, preview)
+            _p(1.0, "Import finished.")
+            plan.diagnostics = (
+                f"Imported {nload} WAV-only voice(s); edit character JSON as needed."
+            )
+            return plan
+
+        nload = len(plan.characters)
+        plan.clone_prompts = {}
+        plan.voice_samples = {}
+        for i, card in enumerate(plan.characters):
+            _p((i + 1) / max(nload, 1), f"Import {card.name} ({i + 1}/{nload})…")
+            fn = str(voice_files.get(card.name) or "").strip()
+            if not fn:
+                fn = f"{safe_voice_archive_basename(card.name)}.wav"
+            member = _find_zip_member_ci(zf, fn)
+            if member is None:
+                member = _find_zip_member_ci(
+                    zf,
+                    f"{safe_voice_archive_basename(card.name)}.wav",
+                )
+            if member is None:
+                logger.warning("Missing WAV for %r (expected %r)", card.name, fn)
+                continue
+            pcm = read_wav_bytes_mono_float32(zf.read(member))
+            vcp, preview, prate = build_voice_clone_from_reference_audio(
+                pcm,
+                ref_text=None,
+            )
+            plan.clone_prompts[card.name] = vcp
+            plan.voice_samples[card.name] = (prate, preview)
+
+        _p(1.0, "Import finished.")
+        plan.diagnostics = f"Imported archive ({len(plan.voice_samples)} voice(s))."
+        return plan
+
+
+def import_voice_wav_files_from_paths(
+    paths: list[str | Path],
+    *,
+    on_progress: Callable[[float, str], None] | None = None,
+) -> AudiobookPlan:
+    """Import one folder’s worth of WAV files (names from stems) via a temporary ZIP path."""
+    uniq = sorted(
+        {Path(p).resolve() for p in paths if str(p).strip()},
+        key=lambda p: p.name.lower(),
+    )
+    wavs = [p for p in uniq if p.suffix.lower() == ".wav"]
+    if not wavs:
+        raise ValueError("Need at least one .wav file.")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in wavs:
+            zf.write(p, arcname=p.name)
+    return import_voice_archive_from_zip_bytes(
+        buf.getvalue(),
+        on_progress=on_progress,
+    )
 
 
 def regenerate_single_voice_sample(
@@ -704,8 +1033,11 @@ def prepare_chapter_segments(
     names = ", ".join(character_names)
     system = (
         "You prepare novel text for expressive text-to-speech. JSON only. "
-        "Each segment `speaker` MUST be exactly one of the allowed JSON strings (verbatim); "
-        "otherwise the audiobook engine cannot select the correct voice clone."
+        "In the host app, each cast name already has **one OmniVoice voice clone**; each segment’s "
+        "`speaker` field **selects which clone** synthesizes that line (`voice_instruct` was fixed "
+        "at casting time — it is not re-specified here). "
+        "`speaker` MUST be exactly one of the allowed JSON strings (verbatim); "
+        "otherwise the engine cannot select the correct voice."
     )
     body = (chapter_body or "").strip()[:14_000]
     cast_verbatim = "\n".join(f"  {json.dumps(n, ensure_ascii=False)}" for n in character_names)
@@ -728,10 +1060,10 @@ Rules:
 - Never invent new `speaker` values or use pronouns (“he”, “she”, “they”) as `speaker` — always the character’s listed name or "Narrator".
 - For tricky names, add IPA once inside `text`, e.g. Hermione (hɜːˈmaɪəni).
 - You may prefix [emotion] tags like [warmly], [tense], [sorrowful] inside `text` where useful.
-- `extra_instruct` rarely: only a single extra allowed tag such as whisper (otherwise null).
-- Split into natural beats (dialogue vs narration). Keep each text under ~400 characters when possible."""
+- `extra_instruct` rarely: only one extra OmniVoice Style token when needed (otherwise null). See voice-design.md Style list.
+- Split into natural beats (dialogue vs narration). Keep each text under ~400 characters when possible.
 
-    raw = chat_complete(system, user, max_new_tokens=2000)
+{LLM_INSTRUCTIONS_TTS_SPEAKER_AND_CLONES}"""
     data = extract_json_object(raw)
     segs = data.get("segments")
     if not isinstance(segs, list):

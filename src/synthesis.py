@@ -149,7 +149,11 @@ def coerce_voice_instruct_for_omnivoice(
 
 
 def get_or_load_model() -> OmniVoice:
-    """Lazy-load the shared OmniVoice model (idempotent)."""
+    """Lazy-load the shared OmniVoice model (idempotent).
+
+    Reference transcription for voice cloning uses local **onnx-asr** Parakeet (optional) or HTTP STT —
+    OmniVoice’s optional built-in speech-to-text stack is not loaded (``load_asr=False``).
+    """
     global _MODEL_CACHE
     if _MODEL_CACHE is not None:
         return _MODEL_CACHE
@@ -159,6 +163,7 @@ def get_or_load_model() -> OmniVoice:
         MODEL_ID,
         device_map=device_map,
         dtype=dtype,
+        load_asr=False,
     )
     return _MODEL_CACHE
 
@@ -236,7 +241,10 @@ def build_voice_clone_from_reference_audio(
 ) -> tuple[VoiceClonePrompt, np.ndarray, int]:
     """Build a :class:`VoiceClonePrompt` from an uploaded clip; preview at :data:`SAMPLE_RATE`.
 
-    *ref_text*: transcript of the clip. Empty or ``None`` triggers OmniVoice ASR (if available).
+    *ref_text*: transcript of the clip. If unset, uses **local Parakeet ONNX** via ``onnx-asr``
+    when installed (``pip install "book2audio[parakeet-stt]"`` — Hugging Face download on first use), or
+    HTTP STT if ``BOOK2AUDIO_STT_BACKEND=http``. See ``book2audio.stt_parakeet`` for all env vars, or paste
+    the transcript to skip STT.
     """
     pair = _mono_float32_from_gradio(audio)
     if pair is None:
@@ -245,6 +253,11 @@ def build_voice_clone_from_reference_audio(
     model = get_or_load_model()
     tensor = torch.from_numpy(mono).unsqueeze(0)
     rt = (ref_text or "").strip() or None
+    if rt is None:
+        from book2audio.stt_parakeet import transcribe_reference_float32
+
+        rt = transcribe_reference_float32(mono, sr_in)
+        logger.info("Reference transcript (Parakeet kit): %s", rt[:160])
     vcp = model.create_voice_clone_prompt(
         ref_audio=(tensor, sr_in),
         ref_text=rt,

@@ -6,7 +6,6 @@ import io
 import json
 import logging
 import os
-import re
 import tempfile
 import wave
 import zipfile
@@ -18,17 +17,22 @@ import numpy as np
 from book2audio.audiobook_pipeline import (
     AudiobookPlan,
     EXAMPLE_CHARACTERS_EDITOR_JSON,
+    VOICE_ARCHIVE_JSON,
     apply_external_reference_voice_to_character,
     assign_omnivoice_profiles,
     build_clone_prompts_for_cast,
     character_rows_to_editor_json,
     format_character_research_messages_for_external_llm,
+    import_voice_archive_from_zip_bytes,
+    import_voice_wav_files_from_paths,
     parse_character_json,
     prepare_chapter_segments,
     regenerate_single_voice_sample,
     research_characters,
+    safe_voice_archive_basename,
     split_into_chapters,
     synthesize_segments,
+    voice_archive_dict_from_plan,
 )
 from book2audio.device import pick_device_and_dtype
 from book2audio.llm_qwen import default_llm_model_id
@@ -46,18 +50,16 @@ def _wav_bytes_mono_float32(sample_rate: int, audio: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
-def _safe_voice_sample_filename(name: str) -> str:
-    base = re.sub(r'[<>:"/\\|?*\n\r]+', "_", (name or "").strip()) or "voice"
-    return base[:120]
-
-
 def _zip_voice_samples_to_tempfile(plan: AudiobookPlan) -> str:
+    manifest = voice_archive_dict_from_plan(plan)
+    manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2)
     fd, path = tempfile.mkstemp(prefix="book2audio_voice_samples_", suffix=".zip")
     os.close(fd)
     try:
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(VOICE_ARCHIVE_JSON, manifest_json)
             for display_name, (rate, wav) in plan.voice_samples.items():
-                fn = _safe_voice_sample_filename(display_name) + ".wav"
+                fn = manifest["voice_files"][display_name]
                 zf.writestr(fn, _wav_bytes_mono_float32(rate, wav))
         return path
     except Exception:
@@ -168,6 +170,136 @@ def _download_all_voice_samples_zip(session: AudiobookPlan | None) -> str | None
         return None
 
 
+def _resolve_upload_path(upload: Any) -> str | None:
+    """Turn a Gradio File/FileData value into a local filesystem path."""
+    if upload is None:
+        return None
+    # Gradio 6+: FileData (and similar) expose server temp path here.
+    path = getattr(upload, "path", None)
+    if isinstance(path, str) and path.strip():
+        return path.strip()
+    # Serialized FileData from the browser can arrive as a plain dict.
+    if isinstance(upload, dict):
+        p = upload.get("path")
+        if isinstance(p, str) and p.strip():
+            return p.strip()
+    # Older tempfile wrapper / pathlib / str path
+    name = getattr(upload, "name", None)
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    if isinstance(upload, str) and upload.strip():
+        return upload.strip()
+    return None
+
+
+def _import_voice_archive_zip(
+    upload: Any,
+    session: AudiobookPlan | None,
+    progress: gr.Progress = gr.Progress(),
+) -> tuple[str, AudiobookPlan, gr.update, Any]:
+    path = _resolve_upload_path(upload)
+    if not path:
+        gr.Warning("Select a .zip (full archive or WAV-only).")
+        plan = session or AudiobookPlan()
+        names = list(plan.voice_samples.keys())
+        pick = names[0] if names else None
+        return (
+            character_rows_to_editor_json(plan.raw_character_rows),
+            "No archive selected.",
+            plan,
+            gr.update(choices=names, value=pick),
+            plan.voice_samples.get(pick) if pick else None,
+        )
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+
+        def report(frac: float, msg: str) -> None:
+            progress(frac, desc=msg)
+
+        plan = import_voice_archive_from_zip_bytes(blob, on_progress=report)
+    except Exception as exc:
+        gr.Error(f"Voice archive import failed: {exc}")
+        plan = session or AudiobookPlan()
+        names = list(plan.voice_samples.keys())
+        pick = names[0] if names else None
+        return (
+            character_rows_to_editor_json(plan.raw_character_rows),
+            str(exc),
+            plan,
+            gr.update(choices=names, value=pick),
+            plan.voice_samples.get(pick) if pick else None,
+        )
+    editor = character_rows_to_editor_json(plan.raw_character_rows)
+    names = list(plan.voice_samples.keys()) or [c.name for c in plan.characters]
+    first = names[0] if names else None
+    audio = plan.voice_samples.get(first) if first else None
+    return (
+        editor,
+        plan.diagnostics,
+        plan,
+        gr.update(choices=names, value=first),
+        audio,
+    )
+
+
+def _import_voice_wavs_only(
+    upload_list: Any,
+    session: AudiobookPlan | None,
+    progress: gr.Progress = gr.Progress(),
+) -> tuple[str, AudiobookPlan, gr.update, Any]:
+    raw = upload_list
+    if raw is None:
+        files: list[Any] = []
+    elif isinstance(raw, list):
+        files = raw
+    else:
+        files = [raw]
+    paths = [_resolve_upload_path(f) for f in files]
+    paths = [p for p in paths if p]
+    if not paths:
+        gr.Warning("Upload one or more .wav files.")
+        plan = session or AudiobookPlan()
+        names = list(plan.voice_samples.keys())
+        pick = names[0] if names else None
+        return (
+            character_rows_to_editor_json(plan.raw_character_rows),
+            "No WAVs selected.",
+            plan,
+            gr.update(choices=names, value=pick),
+            plan.voice_samples.get(pick) if pick else None,
+        )
+    try:
+
+        def report(frac: float, msg: str) -> None:
+            progress(frac, desc=msg)
+
+        plan = import_voice_wav_files_from_paths(paths, on_progress=report)
+    except Exception as exc:
+        gr.Error(f"WAV import failed: {exc}")
+        plan = session or AudiobookPlan()
+        names = list(plan.voice_samples.keys())
+        pick = names[0] if names else None
+        return (
+            character_rows_to_editor_json(plan.raw_character_rows),
+            str(exc),
+            plan,
+            gr.update(choices=names, value=pick),
+            plan.voice_samples.get(pick) if pick else None,
+        )
+    editor = character_rows_to_editor_json(plan.raw_character_rows)
+    names = list(plan.voice_samples.keys())
+    first = names[0] if names else None
+    audio = plan.voice_samples.get(first) if first else None
+    return (
+        editor,
+        plan.diagnostics,
+        plan,
+        gr.update(choices=names, value=first),
+        audio,
+    )
+
+
 def _synthesize_for_ui(text: str, instruct: str):
     result = synthesize_to_numpy(text, instruct)
     if result is None:
@@ -200,13 +332,16 @@ def _extract_characters_step(
     plan = session or AudiobookPlan()
     plan.voice_samples = {}
     plan.clone_prompts = {}
+    plan.character_research_blob = ""
     plan.characters = []
+    plan.raw_character_rows = []
 
     def report(frac: float, msg: str) -> None:
         progress(frac, desc=msg)
 
     try:
-        data = research_characters(title, author, on_progress=report)
+        data, blob = research_characters(title, author, on_progress=report)
+        plan.character_research_blob = blob
     except Exception as exc:
         gr.Error(f"Character extraction failed: {exc}")
         return "", str(exc), plan, gr.update(choices=[], value=None), None
@@ -434,6 +569,12 @@ def main() -> None:
                 gr.Markdown(
                     "Qwen assigns OmniVoice voice tags from the character list; OmniVoice then synthesizes **one short clip per character** "
                     "and builds voice-clone prompts. Edit the JSON above if needed, then run the button below.\n\n"
+                    "**Transcription for reference clips** (WAV import / **Use uploaded clip** without typed text): by default Book2Audio "
+                    "uses **local Parakeet ONNX** via `onnx-asr` "
+                    "(`nemo-parakeet-tdt-0.6b-v3` from Hugging Face; **first run downloads the model**). "
+                    "Install with `pip install \"book2audio[parakeet-stt]\"`. "
+                    "Optional: set `BOOK2AUDIO_STT_BACKEND=http` and run a compatible OpenAI-style server "
+                    "(e.g. `BOOK2AUDIO_STT_API_URL`), or **paste the spoken words** to skip STT.\n\n"
                     "You can also **upload your own short reference recording** for a character (after voice setup): pick them in the "
                     "dropdown, add optional transcript text, and click **Use uploaded clip**."
                 )
@@ -471,9 +612,9 @@ def main() -> None:
                     type="numpy",
                 )
                 external_ref_transcript = gr.Textbox(
-                    label="Words spoken in that clip (recommended; else OmniVoice may ASR)",
+                    label="Words spoken in that clip (recommended; else local ONNX Parakeet / optional HTTP STT)",
                     lines=2,
-                    placeholder='Exact transcript of the uploaded audio.',
+                    placeholder="Exact transcript, or leave empty to transcribe with pip install \"book2audio[parakeet-stt]\" (HF download on first run) or BOOK2AUDIO_STT_BACKEND=http.",
                 )
                 btn_apply_external_voice = gr.Button(
                     "Use uploaded clip for selected character",
@@ -485,6 +626,27 @@ def main() -> None:
                 )
                 btn_download_samples = gr.Button(
                     "Build ZIP of all voice samples",
+                    variant="secondary",
+                )
+                gr.Markdown(
+                    "The ZIP includes **`book2audio_session.json`** (character rows/cards, optional web-research blob, "
+                    "and voice filenames) plus one **`.wav`** per character — suitable for backup or moving to another machine."
+                )
+                import_voice_zip = gr.File(
+                    label="Import voice archive (.zip)",
+                    file_types=[".zip"],
+                )
+                btn_import_voice_zip = gr.Button(
+                    "Load voice archive ZIP",
+                    variant="secondary",
+                )
+                import_voice_many = gr.File(
+                    label="Import WAVs only (multiple · character name = filename without .wav)",
+                    file_count="multiple",
+                    file_types=[".wav"],
+                )
+                btn_import_voice_wavs = gr.Button(
+                    "Load WAV files only",
                     variant="secondary",
                 )
 
@@ -562,6 +724,30 @@ def main() -> None:
                     _download_all_voice_samples_zip,
                     inputs=[session],
                     outputs=[samples_zip],
+                )
+                btn_import_voice_zip.click(
+                    _import_voice_archive_zip,
+                    inputs=[import_voice_zip, session],
+                    outputs=[
+                        characters_editor,
+                        log_voices,
+                        session,
+                        voice_pick,
+                        voice_preview,
+                    ],
+                    show_progress="full",
+                )
+                btn_import_voice_wavs.click(
+                    _import_voice_wavs_only,
+                    inputs=[import_voice_many, session],
+                    outputs=[
+                        characters_editor,
+                        log_voices,
+                        session,
+                        voice_pick,
+                        voice_preview,
+                    ],
+                    show_progress="full",
                 )
                 btn_prep.click(
                     _prepare_chapter,

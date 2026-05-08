@@ -80,6 +80,8 @@ def test_external_character_prompt_skips_web_blob():
     assert "===" not in copy_paste
     assert "OmniVoice" in user
     assert "voice-design.md" in user
+    assert "Audiobook TTS linkage" in user
+    assert "Audiobook TTS linkage" in copy_paste
 
 
 def test_local_character_prompt_includes_web_blob():

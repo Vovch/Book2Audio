@@ -27,6 +27,12 @@ amd = [
 dev = [
     "pytest>=8",
 ]
+# Local Parakeet STT via onnx-asr (HF download on first run).
+# Windows: optionally replace ``onnxruntime`` with ``onnxruntime-directml`` for DML providers.
+parakeet-stt = [
+    "onnx-asr[hub]>=0.1.0",
+    "onnxruntime>=1.16",
+]
 
 # Map import name "book2audio" to the src/ tree (no src/book2audio/ subfolder).
 [tool.setuptools.package-dir]
