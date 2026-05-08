@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import numpy as np
 import torch
 from omnivoice import OmniVoice
 from omnivoice.models.omnivoice import VoiceClonePrompt, _resolve_instruct
-from omnivoice.utils.voice_design import _INSTRUCT_MUTUALLY_EXCLUSIVE, _INSTRUCT_VALID_EN
+from omnivoice.utils.voice_design import (
+    _INSTRUCT_EN_TO_ZH,
+    _INSTRUCT_MUTUALLY_EXCLUSIVE,
+    _INSTRUCT_VALID_EN,
+    _INSTRUCT_VALID_ZH,
+)
 
 from book2audio.device import pick_device_and_dtype
 
@@ -17,6 +23,71 @@ logger = logging.getLogger(__name__)
 _MODEL_CACHE: OmniVoice | None = None
 MODEL_ID = "k2-fsa/OmniVoice"
 SAMPLE_RATE = 24_000
+
+# Short line for Chinese voice-design preview when ``BOOK2AUDIO_ZH_VOICE_DESIGN_SAMPLE`` is set.
+_ZH_VOICE_SAMPLE_LINE = "您好，这是我在这个故事里的声音。"
+
+# OmniVoice often misfires when **child** / **teenager** are combined with explicit pitch tags; omit pitch.
+OMNIVOICE_AGE_OMIT_PITCH_EN: frozenset[str] = frozenset({"child", "teenager"})
+OMNIVOICE_AGE_OMIT_PITCH_ZH: frozenset[str] = frozenset(
+    _INSTRUCT_EN_TO_ZH[a] for a in OMNIVOICE_AGE_OMIT_PITCH_EN
+)
+OMNIVOICE_PITCH_EN: frozenset[str] = frozenset(
+    {
+        "very low pitch",
+        "low pitch",
+        "moderate pitch",
+        "high pitch",
+        "very high pitch",
+    }
+)
+OMNIVOICE_PITCH_ZH: frozenset[str] = frozenset(
+    _INSTRUCT_EN_TO_ZH[p] for p in OMNIVOICE_PITCH_EN
+)
+
+
+def omnivoice_age_should_omit_pitch(age_en: str) -> bool:
+    """Whether resolved English age should not carry an explicit pitch token."""
+    return (age_en or "").strip() in OMNIVOICE_AGE_OMIT_PITCH_EN
+
+
+def _tokens_include_child_or_teen_age(tokens: list[str]) -> bool:
+    for t in tokens:
+        if t in OMNIVOICE_AGE_OMIT_PITCH_EN or t in OMNIVOICE_AGE_OMIT_PITCH_ZH:
+            return True
+    return False
+
+
+def _strip_pitch_tokens_for_young_voice(tokens: list[str]) -> list[str]:
+    if not _tokens_include_child_or_teen_age(tokens):
+        return tokens
+    drop = OMNIVOICE_PITCH_EN | OMNIVOICE_PITCH_ZH
+    return [t for t in tokens if t not in drop]
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolved_english_instruct_to_chinese_voice_design(resolved_en: str) -> str:
+    """Drop English accent tokens and map voice-design tags to Chinese.
+
+    OmniVoice ``_resolve_instruct`` maps Chinese age → English whenever any ``* accent`` is
+    present (English-audio path). For the **short clone-preview** pass only, we omit accent
+    and use Chinese sample text so ``use_zh`` stays true and tags such as 老年 stay Chinese.
+    """
+    parts = [p.strip() for p in (resolved_en or "").split(",") if p.strip()]
+    zh_parts: list[str] = []
+    for p in parts:
+        if " accent" in p:
+            continue
+        zh_parts.append(_INSTRUCT_EN_TO_ZH.get(p, p))
+    if OMNIVOICE_AGE_OMIT_PITCH_ZH & set(zh_parts):
+        zh_parts = [z for z in zh_parts if z not in OMNIVOICE_PITCH_ZH]
+    if not zh_parts:
+        zh_parts = ["男", "中年", "中音调"]
+    return "，".join(zh_parts)
+
 
 # Half-baked LLM phrases -> single OmniVoice token (see omnivoice.utils.voice_design).
 _TOKEN_ALIASES: dict[str, str] = {
@@ -41,10 +112,13 @@ _TOKEN_ALIASES: dict[str, str] = {
 
 
 def _normalize_voice_instruct_token(segment: str) -> str | None:
-    """Map one comma-separated phrase to a valid English instruct token, or ``None`` to drop."""
-    t = segment.strip().lower()
-    if not t:
+    """Map one comma-separated phrase to a valid instruct token, or ``None`` to drop."""
+    raw = segment.strip()
+    if not raw:
         return None
+    if raw in _INSTRUCT_VALID_ZH:
+        return raw
+    t = raw.lower()
     t = _TOKEN_ALIASES.get(t, t)
     if t in _INSTRUCT_VALID_EN:
         return t
@@ -76,19 +150,21 @@ def _filter_mutually_exclusive(tokens: list[str]) -> list[str]:
 
 
 def _ensure_core_english_tags(tokens: list[str]) -> list[str]:
-    """Ensure gender, age, pitch, and one accent so OmniVoice always gets a usable design."""
+    """Ensure gender, age, and one accent; pitch only when age is not child/teenager."""
     present: set[int] = set()
     for tok in tokens:
         for ci, cat in enumerate(_INSTRUCT_MUTUALLY_EXCLUSIVE):
             if tok in cat:
                 present.add(ci)
                 break
+    young = _tokens_include_child_or_teen_age(tokens)
     defaults: list[tuple[int, str]] = [
         (0, "male"),
         (1, "middle-aged"),
-        (2, "moderate pitch"),
         (4, "american accent"),
     ]
+    if not young:
+        defaults.insert(2, (2, "moderate pitch"))
     out = list(tokens)
     for ci, default_tok in defaults:
         if ci not in present:
@@ -105,6 +181,9 @@ def coerce_voice_instruct_for_omnivoice(
 
     LLMs often emit free-text (e.g. *fussy*, *RP British*) that :meth:`OmniVoice.generate`
     rejects. This keeps only allowed English tokens and fills missing core categories.
+
+    **Child / teenager:** explicit pitch tags are dropped and default pitch is not injected —
+    OmniVoice is unreliable when combining those ages with pitch controls.
     """
     raw = (instruct or "").strip()
     if not raw:
@@ -124,6 +203,7 @@ def coerce_voice_instruct_for_omnivoice(
             logger.debug("Dropped unsupported voice instruct fragment: %r", p)
 
     toks = _filter_mutually_exclusive(toks)
+    toks = _strip_pitch_tokens_for_young_voice(toks)
     toks = _ensure_core_english_tags(toks)
     if not toks:
         try:
@@ -274,16 +354,34 @@ def build_voice_clone_from_instruct(
     num_step: int = 12,
     language: str = "English",
 ) -> tuple[VoiceClonePrompt, np.ndarray]:
-    """Synthesize a short line with *instruct*, build :class:`VoiceClonePrompt`, return prompt + mono waveform."""
-    phrase = (sample_text or "").strip() or (
-        "Hello — this is my voice for this story."
-    )
+    """Synthesize a short line with *instruct*, build :class:`VoiceClonePrompt`, return prompt + mono waveform.
+
+    Set environment variable ``BOOK2AUDIO_ZH_VOICE_DESIGN_SAMPLE`` to ``1`` to build the preview
+    clip with **Chinese** voice-design tags (no English ``* accent`` token) and a short Chinese
+    phrase. OmniVoice otherwise converts Chinese age to English whenever an English accent is
+    present in the same ``instruct`` string; this mode is a workaround for age-sensitive previews.
+    Chapter TTS remains English + clone prompts built from the preview audio.
+    """
+    use_zh_sample = _env_flag("BOOK2AUDIO_ZH_VOICE_DESIGN_SAMPLE")
+    if use_zh_sample:
+        phrase = (sample_text or "").strip() or _ZH_VOICE_SAMPLE_LINE
+        lang_for_gen = "Chinese"
+    else:
+        phrase = (sample_text or "").strip() or (
+            "Hello — this is my voice for this story."
+        )
+        lang_for_gen = language
     model = get_or_load_model()
-    resolved = coerce_voice_instruct_for_omnivoice(instruct)
+    resolved_en = coerce_voice_instruct_for_omnivoice(instruct)
+    resolved = (
+        _resolved_english_instruct_to_chinese_voice_design(resolved_en)
+        if use_zh_sample
+        else resolved_en
+    )
     audio_list = model.generate(
         text=phrase,
         instruct=resolved,
-        language=language,
+        language=lang_for_gen,
         num_step=num_step,
     )
     wav = np.asarray(audio_list[0], dtype=np.float32)

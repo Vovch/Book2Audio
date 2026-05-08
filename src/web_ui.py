@@ -38,6 +38,63 @@ from book2audio.device import pick_device_and_dtype
 from book2audio.llm_qwen import default_llm_model_id
 from book2audio.synthesis import synthesize_to_numpy
 
+logger = logging.getLogger(__name__)
+
+
+def _summarize_for_log(label: str, value: Any, *, max_str: int = 600) -> str:
+    """Short, log-safe rendering of Gradio callback arguments (no huge blobs)."""
+    if value is None:
+        return f"{label}=None"
+    if isinstance(value, AudiobookPlan):
+        p = value
+        names = [c.name for c in p.characters]
+        vn = list(p.voice_samples.keys())
+        instr = [c.voice_instruct[:80] + "…" if len(c.voice_instruct) > 80 else c.voice_instruct for c in p.characters[:8]]
+        extra = "…" if len(p.characters) > 8 else ""
+        return (
+            f"{label}=AudiobookPlan(id={id(p)}, n_char={len(p.characters)}, names={names!r}, "
+            f"voice_keys={vn!r}, n_prompts={len(p.clone_prompts)}, "
+            f"instruct_preview[{len(instr)}]={instr!r}{extra})"
+        )
+    if isinstance(value, str):
+        if len(value) > max_str:
+            return f"{label}=str(len={len(value)}, head={value[:max_str]!r}...)"
+        return f"{label}={value!r}"
+    if isinstance(value, (int, float, bool)):
+        return f"{label}={value!r}"
+    if isinstance(value, np.ndarray):
+        return f"{label}=ndarray(shape={value.shape}, dtype={value.dtype})"
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], np.ndarray)
+    ):
+        sr, arr = value
+        return f"{label}=(sr={sr!r}, audio_ndarray(shape={arr.shape}, dtype={arr.dtype}))"
+    if isinstance(value, gr.Progress):
+        return f"{label}=<gr.Progress>"
+    if isinstance(value, (list, tuple)):
+        n = len(value)
+        if n == 0:
+            return f"{label}=empty_{type(value).__name__}"
+        head = value[:5]
+        parts = [_summarize_for_log(f"{label}[{i}]", x, max_str=120) for i, x in enumerate(head)]
+        tail = f", …(+{n - len(head)} more)" if n > len(head) else ""
+        return f"{label}={type(value).__name__}(n={n}, head=[{'; '.join(parts)}]{tail})"
+    path = getattr(value, "path", None)
+    if isinstance(path, str) and path:
+        return f"{label}={type(value).__name__}(path={path!r})"
+    return f"{label}={type(value).__name__}@{id(value)!r}"
+
+
+def _log_ui_event(handler: str, level: int = logging.INFO, **params: Any) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    parts = [_summarize_for_log(k, v) for k, v in params.items()]
+    logger.log(level, "UI event %s → %s", handler, " | ".join(parts))
+
+
 def _wav_bytes_mono_float32(sample_rate: int, audio: np.ndarray) -> bytes:
     s = np.clip(np.asarray(audio, dtype=np.float32).reshape(-1), -1.0, 1.0)
     pcm = np.clip(s * 32767.0, -32768, 32767).astype(np.int16)
@@ -74,8 +131,17 @@ def _regenerate_selected_voice_sample(
     character_name: str,
     sample_steps: float,
     sample_line: str,
+    characters_editor: str,
     session: AudiobookPlan | None,
 ) -> tuple[Any, str, AudiobookPlan]:
+    _log_ui_event(
+        "_regenerate_selected_voice_sample / Regenerate selected voice sample",
+        character_name=character_name,
+        sample_steps=sample_steps,
+        sample_line=sample_line,
+        characters_editor=characters_editor,
+        session=session,
+    )
     plan = session or AudiobookPlan()
     if not character_name:
         gr.Warning("Choose a character in the dropdown first.")
@@ -91,6 +157,7 @@ def _regenerate_selected_voice_sample(
             pick,
             sample_steps=int(sample_steps),
             sample_line=sample_line,
+            editor_text=characters_editor,
         )
     except ValueError as exc:
         gr.Warning(str(exc))
@@ -120,6 +187,13 @@ def _apply_external_voice_sample(
     ref_transcript: str,
     session: AudiobookPlan | None,
 ) -> tuple[Any, str, AudiobookPlan]:
+    _log_ui_event(
+        "_apply_external_voice_sample / Use uploaded clip for selected character",
+        character_name=character_name,
+        ref_audio=ref_audio,
+        ref_transcript=ref_transcript,
+        session=session,
+    )
     plan = session or AudiobookPlan()
     if not character_name:
         gr.Warning("Choose a character in the dropdown first.")
@@ -159,6 +233,7 @@ def _apply_external_voice_sample(
 
 
 def _download_all_voice_samples_zip(session: AudiobookPlan | None) -> str | None:
+    _log_ui_event("_download_all_voice_samples_zip / Build ZIP of all voice samples", session=session)
     plan = session or AudiobookPlan()
     if not plan.voice_samples:
         gr.Warning("No voice samples yet — run “Assign voice tags & generate samples” first.")
@@ -197,6 +272,12 @@ def _import_voice_archive_zip(
     session: AudiobookPlan | None,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str, AudiobookPlan, gr.update, Any]:
+    _log_ui_event(
+        "_import_voice_archive_zip / Load voice archive ZIP",
+        upload=upload,
+        session=session,
+        progress=progress,
+    )
     path = _resolve_upload_path(upload)
     if not path:
         gr.Warning("Select a .zip (full archive or WAV-only).")
@@ -248,6 +329,12 @@ def _import_voice_wavs_only(
     session: AudiobookPlan | None,
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str, AudiobookPlan, gr.update, Any]:
+    _log_ui_event(
+        "_import_voice_wavs_only / Load WAV files only",
+        upload_list=upload_list,
+        session=session,
+        progress=progress,
+    )
     raw = upload_list
     if raw is None:
         files: list[Any] = []
@@ -301,6 +388,7 @@ def _import_voice_wavs_only(
 
 
 def _synthesize_for_ui(text: str, instruct: str):
+    _log_ui_event("_synthesize_for_ui / Generate speech (Phrase tab)", text=text, instruct=instruct)
     result = synthesize_to_numpy(text, instruct)
     if result is None:
         gr.Warning("Enter some text to synthesize.")
@@ -329,6 +417,13 @@ def _extract_characters_step(
     progress: gr.Progress = gr.Progress(),
 ) -> tuple[str, str, AudiobookPlan, gr.update, Any]:
     """Web search + Qwen → fill the editable character list (user can edit afterward)."""
+    _log_ui_event(
+        "_extract_characters_step / Extract characters (web + Qwen)",
+        title=title,
+        author=author,
+        session=session,
+        progress=progress,
+    )
     plan = session or AudiobookPlan()
     plan.voice_samples = {}
     plan.clone_prompts = {}
@@ -363,6 +458,11 @@ def _extract_characters_step(
 
 def _build_external_character_prompt(title: str, author: str) -> str:
     """Format system + user block for an external chat model (no local web search)."""
+    _log_ui_event(
+        "_build_external_character_prompt / Build research prompt for external LLM",
+        title=title,
+        author=author,
+    )
     try:
         _sys, _user, copy_paste = format_character_research_messages_for_external_llm(
             title,
@@ -381,6 +481,13 @@ def _assign_voices_step(
     session: AudiobookPlan | None,
 ) -> tuple[str, AudiobookPlan, gr.update, Any]:
     """Parse editor JSON → Qwen voice tags → OmniVoice sample + clone prompt per role."""
+    _log_ui_event(
+        "_assign_voices_step / Assign voice tags & generate samples",
+        editor_text=editor_text,
+        sample_steps=sample_steps,
+        sample_line=sample_line,
+        session=session,
+    )
     plan = session or AudiobookPlan()
     try:
         rows = parse_character_json(editor_text)
@@ -423,6 +530,12 @@ def _assign_voices_step(
 
 
 def _voice_preview_select(character_name: str, session: AudiobookPlan | None) -> Any:
+    _log_ui_event(
+        "_voice_preview_select / Listen · character dropdown",
+        level=logging.DEBUG,
+        character_name=character_name,
+        session=session,
+    )
     plan = session or AudiobookPlan()
     if not character_name:
         return None
@@ -434,6 +547,12 @@ def _prepare_chapter(
     chapter_index: float,
     session: AudiobookPlan | None,
 ) -> tuple[str, str, AudiobookPlan]:
+    _log_ui_event(
+        "_prepare_chapter / Prepare chapter for TTS (Qwen)",
+        book=book,
+        chapter_index=chapter_index,
+        session=session,
+    )
     plan = session or AudiobookPlan()
     if not plan.characters or not plan.clone_prompts:
         gr.Warning('Run "Assign voice tags & generate samples" first.')
@@ -458,6 +577,11 @@ def _synthesize_chapter(
     session: AudiobookPlan | None,
     tts_steps: float,
 ) -> tuple[Any, str, AudiobookPlan]:
+    _log_ui_event(
+        "_synthesize_chapter / Synthesize chapter audio",
+        session=session,
+        tts_steps=tts_steps,
+    )
     plan = session or AudiobookPlan()
     if not plan.last_segments:
         gr.Warning("Prepare a chapter first.")
@@ -480,7 +604,11 @@ def _synthesize_chapter(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    # INFO: button / primary UI actions. DEBUG: also character dropdown changes.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     _dm, dtype, label = pick_device_and_dtype()
     qwen_id = default_llm_model_id()
     with gr.Blocks(title="Book2Audio · OmniVoice") as demo:
@@ -607,6 +735,13 @@ def main() -> None:
                     "Regenerate selected voice sample",
                     variant="secondary",
                 )
+                gr.Markdown(
+                    "**Regenerate** reads the **current Characters JSON**, updates **role** / **summary** / "
+                    "**voice_gender**, **voice_age**, **voice_characteristics**, **voice_accent** from the editor, then "
+                    "rebuilds **voice_instruct** for the selected role with the same deterministic rules as the app "
+                    "(no extra Qwen call). Run **Assign voice tags & generate samples** again if you want the LLM "
+                    "to retag the whole cast."
+                )
                 external_ref_audio = gr.Audio(
                     label="External reference clip (optional · for selected character)",
                     type="numpy",
@@ -710,7 +845,7 @@ def main() -> None:
                 )
                 btn_regen_voice.click(
                     _regenerate_selected_voice_sample,
-                    inputs=[voice_pick, sample_steps, sample_line, session],
+                    inputs=[voice_pick, sample_steps, sample_line, characters_editor, session],
                     outputs=[voice_preview, log_voices, session],
                     show_progress="full",
                 )

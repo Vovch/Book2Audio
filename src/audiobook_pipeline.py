@@ -22,6 +22,7 @@ from book2audio.synthesis import (
     SAMPLE_RATE,
     build_voice_clone_from_instruct,
     build_voice_clone_from_reference_audio,
+    omnivoice_age_should_omit_pitch,
     synthesize_voice_clone_to_numpy,
 )
 from omnivoice.models.omnivoice import VoiceClonePrompt
@@ -144,6 +145,13 @@ def _normalize_character_row(item: dict[str, Any]) -> dict[str, str] | None:
         val = str(raw).strip()
         if val:
             out[key] = val
+    # Some LLM payloads use "age" instead of voice_age — keep voice_* canonical output.
+    if "voice_age" not in out:
+        raw_age = item.get("voice_age") or item.get("age")
+        if raw_age is not None:
+            s = str(raw_age).strip()
+            if s:
+                out["voice_age"] = s
     raw_g = out.get("voice_gender", "")
     gl = str(raw_g).strip().lower()
     if not gl or gl == "unknown":
@@ -155,39 +163,127 @@ def _normalize_character_row(item: dict[str, Any]) -> dict[str, str] | None:
     return out
 
 
+def _voice_age_fragment_for_row(row: dict[str, Any]) -> str:
+    """Raw age string from editor/LLM row (supports common key aliases)."""
+    for key in ("voice_age", "age", "voice_age_group", "life_stage"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if s:
+            return s
+    return ""
+
+
+def _normalize_age_text(s: str) -> str:
+    t = (s or "").strip().lower()
+    for ch in ("\u2013", "\u2014", "\u2212"):  # en, em, minus
+        t = t.replace(ch, "-")
+    t = t.replace("_", " ")
+    while "  " in t:
+        t = t.replace("  ", " ")
+    return t
+
+
+def resolve_voice_age_token(age_raw: str) -> str:
+    """Map ``voice_age`` / ``age`` free text to an OmniVoice **age** token.
+
+    Longer phrases are matched first so e.g. *young adult* wins over *adult*.
+    """
+    s = _normalize_age_text(age_raw)
+    if not s:
+        return "middle-aged"
+
+    exact_ok = {"child", "teenager", "young adult", "middle-aged", "elderly"}
+    if s in exact_ok:
+        return s
+    # Hyphen/space variants already normalized for contains checks; allow compact tokens.
+    compact = s.replace("-", " ").replace("  ", " ").strip()
+    if compact in exact_ok:
+        return compact
+
+    aliases: list[tuple[str, str]] = [
+        ("young adult", "young adult"),
+        ("middle aged", "middle-aged"),
+        ("middle-aged", "middle-aged"),
+        ("young-adult", "young adult"),
+        ("middle-age", "middle-aged"),
+        ("octogenarian", "elderly"),
+        ("nonagenarian", "elderly"),
+        ("centenarian", "elderly"),
+        ("adolescent", "teenager"),
+        ("teenager", "teenager"),
+        ("teenage", "teenager"),
+        ("children", "child"),
+        ("geriatric", "elderly"),
+        ("elderly", "elderly"),
+        ("seniors", "elderly"),
+        ("senior", "elderly"),
+        ("infant", "child"),
+        ("toddler", "child"),
+        ("teen", "teenager"),
+        ("child", "child"),
+        ("kids", "child"),
+        ("kid", "child"),
+        ("elder", "elderly"),
+        ("old age", "elderly"),
+        ("late middle", "middle-aged"),
+        ("prime adult", "young adult"),
+        ("twenties", "young adult"),
+        ("thirties", "young adult"),
+        ("forties", "middle-aged"),
+        ("fifties", "middle-aged"),
+        ("sixties", "elderly"),
+        ("seventies", "elderly"),
+        ("eighties", "elderly"),
+        ("20s", "young adult"),
+        ("30s", "young adult"),
+        ("40s", "middle-aged"),
+        ("50s", "middle-aged"),
+        ("60s", "elderly"),
+        ("70s", "elderly"),
+        ("80s", "elderly"),
+        ("90s", "elderly"),
+        ("youth", "young adult"),
+        ("young", "young adult"),
+        ("ya", "young adult"),
+        ("mature", "middle-aged"),
+        ("middle", "middle-aged"),
+    ]
+    by_len = sorted(aliases, key=lambda x: len(x[0]), reverse=True)
+    for needle, tag in by_len:
+        if needle in s or s == needle.replace(" ", "-"):
+            return tag
+    if s == "adult":
+        return "young adult"
+    return "middle-aged"
+
+
 def _omnivoice_instruct_from_row(row: dict[str, Any]) -> str:
     """Build OmniVoice tag string from editor voice_* fields when the LLM returns a weak instruct."""
     g = str(row.get("voice_gender", "male")).strip().lower()
     gender = "female" if g == "female" else "male"
-    age_raw = str(row.get("voice_age", "middle-aged")).strip().lower()
-    age_aliases = [
-        ("child", "child"),
-        ("teenager", "teenager"),
-        ("young adult", "young adult"),
-        ("young", "young adult"),
-        ("middle-aged", "middle-aged"),
-        ("middle aged", "middle-aged"),
-        ("elderly", "elderly"),
-    ]
-    age = "middle-aged"
-    for needle, tag in age_aliases:
-        if needle in age_raw or age_raw == needle.replace(" ", "-"):
-            age = tag
-            break
+    age = resolve_voice_age_token(_voice_age_fragment_for_row(row))
     ch = str(row.get("voice_characteristics", "")).lower()
-    tok = OMNIVOICE_HUSHED_STYLE_TOKEN
-    if tok in ch or "breathy" in ch or "hushed" in ch or "under breath" in ch:
-        pitch = tok
-    elif any(x in ch for x in ("very low", "deep", "gravel")):
-        pitch = "very low pitch"
-    elif any(x in ch for x in ("low pitch", "low,", " low ", "deep")):
-        pitch = "low pitch"
-    elif any(x in ch for x in ("very high", "shrill")):
-        pitch = "very high pitch"
-    elif any(x in ch for x in ("high pitch", "bright", "light")):
-        pitch = "high pitch"
-    else:
-        pitch = "moderate pitch"
+    tok = OMNIVOICE_HUSHED_STYLE_TOKEN  # Style: ``whisper`` (see voice-design.md)
+    wants_whisper = (
+        tok in ch
+        or "breathy" in ch
+        or "hushed" in ch
+        or "under breath" in ch
+    )
+    omit_pitch = omnivoice_age_should_omit_pitch(age)
+    if not omit_pitch:
+        if any(x in ch for x in ("very low", "deep", "gravel")):
+            pitch = "very low pitch"
+        elif any(x in ch for x in ("low pitch", "low,", " low ", "deep")):
+            pitch = "low pitch"
+        elif any(x in ch for x in ("very high", "shrill")):
+            pitch = "very high pitch"
+        elif any(x in ch for x in ("high pitch", "bright", "light")):
+            pitch = "high pitch"
+        else:
+            pitch = "moderate pitch"
 
     acc_raw = str(row.get("voice_accent", "")).strip().lower()
     accent = "american accent"
@@ -210,7 +306,11 @@ def _omnivoice_instruct_from_row(row: dict[str, Any]) -> str:
     elif "portuguese" in acc_raw or "brazil" in acc_raw:
         accent = "portuguese accent"
 
-    return f"{gender}, {age}, {pitch}, {accent}"
+    parts = [gender, age] if omit_pitch else [gender, age, pitch]
+    if wants_whisper:
+        parts.append(tok)
+    parts.append(accent)
+    return ", ".join(parts)
 
 
 def _instruct_from_llm_usable(instruct: str, *, default: str = "moderate pitch, american accent") -> bool:
@@ -221,8 +321,14 @@ def _instruct_from_llm_usable(instruct: str, *, default: str = "moderate pitch, 
         return False
     low = s.lower()
     tok = OMNIVOICE_HUSHED_STYLE_TOKEN
+    young_age_word = any(
+        x in low for x in ("child", "teenager", "儿童", "少年")
+    )
     return ("male" in low or "female" in low) and (
-        "accent" in low or "pitch" in low or tok in low
+        "accent" in low
+        or "pitch" in low
+        or tok in low
+        or young_age_word
     )
 
 
@@ -1001,13 +1107,77 @@ def regenerate_single_voice_sample(
     *,
     sample_steps: int,
     sample_line: str | None,
+    editor_text: str | None = None,
 ) -> AudiobookPlan:
-    """Re-run OmniVoice sample + clone prompt for one cast member; updates ``plan`` in place."""
+    """Re-run OmniVoice sample + clone prompt for one cast member; updates ``plan`` in place.
+
+    If *editor_text* is provided (current **Characters** JSON), it is parsed first so **role**,
+    **summary**, and **voice_\\*** fields edited by hand are applied before regenerating.
+    The selected character’s ``voice_instruct`` is rebuilt with
+    :func:`_omnivoice_instruct_from_row` so tags always match the editor (regenerate does not
+    call Qwen per character — use **Assign voice tags & generate samples** for LLM-assisted
+    tagging of the full cast).
+    """
     name = (character_name or "").strip()
     if not name:
         raise ValueError("Select a character name")
     if not plan.characters:
         raise ValueError("No cast in session — run voice setup first")
+
+    if editor_text is not None and str(editor_text).strip():
+        rows = parse_character_json(editor_text)
+        if not rows:
+            raise ValueError(
+                "Character JSON is empty or invalid — fix the editor or run voice setup again."
+            )
+        plan.raw_character_rows = rows
+        by_lower: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            n = str(r.get("name", "")).strip()
+            if n:
+                by_lower[n.lower()] = r
+        if name.lower() not in by_lower:
+            raise ValueError(
+                f"Character {name!r} not found in the JSON editor — check spelling or add this name."
+            )
+        new_chars: list[CharacterCard] = []
+        for c in plan.characters:
+            r = by_lower.get(c.name.lower())
+            if r is not None:
+                new_chars.append(
+                    CharacterCard(
+                        name=c.name,
+                        role=str(r.get("role", "")).strip(),
+                        summary=str(r.get("summary", "")).strip(),
+                        voice_instruct=c.voice_instruct,
+                    )
+                )
+            else:
+                new_chars.append(c)
+        plan.characters = new_chars
+        row = by_lower[name.lower()]
+        nm = str(row.get("name", "")).strip()
+        fresh_card = CharacterCard(
+            name=nm,
+            role=str(row.get("role", "")).strip(),
+            summary=str(row.get("summary", "")).strip(),
+            voice_instruct=_omnivoice_instruct_from_row(row),
+        )
+        logger.info(
+            "regenerate_single_voice_sample: editor sync for %r → voice_instruct=%r "
+            "(voice_gender=%r voice_age=%r voice_accent=%r)",
+            nm,
+            fresh_card.voice_instruct,
+            row.get("voice_gender"),
+            row.get("voice_age"),
+            row.get("voice_accent"),
+        )
+        plan.characters = [
+            fresh_card if c.name.lower() == fresh_card.name.lower() else c
+            for c in plan.characters
+        ]
+        name = fresh_card.name.strip()
+
     card = next((c for c in plan.characters if c.name.lower() == name.lower()), None)
     if card is None:
         raise ValueError(f"No character named {name!r} in the current cast")
